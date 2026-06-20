@@ -72,6 +72,13 @@ static constexpr int   kTrainSamples= kNPerClass * kNClasses - kValSamples; // 5
 // pick. The output layer is always softmax.
 static constexpr Activation kHiddenAct = Activation::ReLU;
 
+// (push 0003) Dropout probability applied to every HIDDEN layer during training
+// (0 disables it). Demonstrates regularization built on the on-device RNG. With
+// inverted dropout, inference (validation) automatically runs without dropout.
+// On this easily-separable dataset dropout isn't needed for accuracy, but it
+// shows the mechanism: training metrics get noisier while held-out val stays high.
+static constexpr float kDropoutP = 0.2f;
+
 // (push 0002) Optimizer + learning rate for training. Try:
 //   opt_sgd(0.10f)            — plain SGD (the push-0001 behavior)
 //   opt_momentum(0.10f, 0.9f) — SGD with heavy-ball momentum
@@ -241,6 +248,42 @@ static void run_gemm_microbenchmark() {
 }
 
 // =============================================================================
+// static helper: run_rng_selftest                              (push 0003)
+// -----------------------------------------------------------------------------
+// WHAT:  Fill a large array with the on-device counter-based RNG (fill_uniform),
+//        then use the push-0002 parallel reduction (launch_reduce_sum) to compute
+//        the mean. For a uniform distribution on [0,1) the mean should be ≈ 0.5,
+//        so this both demonstrates the generator and double-checks the reduction.
+// WHY:   The same RNG (hash of (seed, index)) drives dropout; verifying it here in
+//        isolation makes dropout's behavior easy to trust. It also shows two
+//        features composing: RNG (0003) feeding the reduction (0002).
+// =============================================================================
+static void run_rng_selftest() {
+    const int N = 1 << 20;          // ~1.05M samples — enough for a stable mean
+    Matrix u = matrix_alloc(1, N);  // device buffer for the random values
+
+    // Fill with uniforms in [0,1) from the counter-based RNG.
+    launch_fill_uniform(u.data, N, kSeed);
+
+    // Mean via the GPU tree reduction (sum / N).
+    float mean = launch_reduce_sum(u.data, N) / static_cast<float>(N);
+
+    // Copy the first few values to the host just to SEE concrete random numbers.
+    float head[6] = {0};
+    CUDA_CHECK(cudaMemcpy(head, u.data, sizeof(float) * 6, cudaMemcpyDeviceToHost));
+
+    printf("============== RNG SELF-TEST ======================\n");
+    printf("counter-based RNG: %d uniforms in [0,1), seed=%llu\n",
+           N, (unsigned long long)kSeed);
+    printf("  first values : %.4f %.4f %.4f %.4f %.4f %.4f\n",
+           head[0], head[1], head[2], head[3], head[4], head[5]);
+    printf("  mean         : %.5f   (expected ~0.5 for uniform[0,1))\n", mean);
+    printf("====================================================\n\n");
+
+    matrix_free(u);
+}
+
+// =============================================================================
 // main — the full pipeline.
 // =============================================================================
 int main() {
@@ -256,6 +299,10 @@ int main() {
     // variant, and teaches why shared-memory tiling matters.
     // -------------------------------------------------------------------------
     run_gemm_microbenchmark();
+
+    // (push 0003) RNG self-test: verify the on-device counter-based RNG (mean≈0.5)
+    // — the same generator that powers dropout below. Reuses the 0002 reduction.
+    run_rng_selftest();
 
     // -------------------------------------------------------------------------
     // STEP 2: build the synthetic dataset on the HOST, then standardize it.
@@ -290,10 +337,12 @@ int main() {
     //   are He-initialized (N(0, sqrt(2/in))) for ReLU; biases start at 0. The
     //   per-layer Matrix caches (Z, A, dW, db, dZ, dA) are sized for kBatchSize.
     //   (push 0002) Every hidden layer uses kHiddenAct (ReLU/LeakyReLU/Tanh).
+    //   (push 0003) Every hidden layer also applies dropout kDropoutP in training.
     // -------------------------------------------------------------------------
     const int layer_sizes[] = { kNFeatures, kHidden0, kHidden1, kNClasses };
     const int num_sizes = static_cast<int>(sizeof(layer_sizes) / sizeof(int));
-    MLP net = mlp_create(layer_sizes, num_sizes, kBatchSize, kSeed, kHiddenAct);
+    MLP net = mlp_create(layer_sizes, num_sizes, kBatchSize, kSeed,
+                         kHiddenAct, kDropoutP);
 
     // (push 0002) Create the optimizer. It allocates whatever per-parameter STATE
     // its rule needs (none for SGD; a velocity for Momentum; first/second moments
@@ -380,8 +429,8 @@ int main() {
     CUDA_CHECK(cudaEventCreate(&train_stop));
     CUDA_CHECK(cudaEventRecord(train_start)); // mark start of all training
 
-    printf("==================== TRAINING (%s, lr=%.3g) ==========\n",
-           opt_name(opt.cfg.type), opt.cfg.lr);
+    printf("==================== TRAINING (%s, lr=%.3g, dropout=%.2f) =====\n",
+           opt_name(opt.cfg.type), opt.cfg.lr, kDropoutP);
     for (int epoch = 0; epoch < kEpochs; ++epoch) {
         // Shuffle the TRAIN rows and labels together (Fisher-Yates) so each epoch
         // sees data in a new order. We vary the seed by epoch to get a different
@@ -393,6 +442,11 @@ int main() {
         double epoch_acc  = 0.0; // sum of per-batch accuracies
         for (int b = 0; b < n_batches; ++b) {
             load_batch(b);                       // inputs+labels -> device
+
+            // (push 0003) Advance the RNG counter so this step draws a FRESH
+            // dropout mask (different units dropped each step). mlp_grad_check, by
+            // contrast, holds rng_state fixed so its masks are reproducible.
+            net.rng_state++;
 
             mlp_forward(net, d_batch);           // forward pass through the net
 

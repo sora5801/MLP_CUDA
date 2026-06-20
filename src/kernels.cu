@@ -776,3 +776,134 @@ void launch_predictions_correct(const float* probs, const int* labels,
     predictions_correct<<<grid, block>>>(probs, labels, correct, rows, cols);
     CUDA_CHECK_LAST();
 }
+
+// =============================================================================
+// =============================================================================
+//  ADDED IN PUSH 0003 — on-device random numbers + dropout.
+//  A stateless, counter-based RNG (each value is a hash of (seed, index)) plus
+//  inverted-dropout forward/backward kernels that consume it. See
+//  docs/changelog/0003-*.md and docs/cuda_concepts.md ("On-device RNG").
+// =============================================================================
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+//  rng_uniform — device helper: hash (seed, idx) -> uniform float in [0, 1).
+// -----------------------------------------------------------------------------
+//  THE COUNTER-BASED RNG IDEA. A classic CPU RNG keeps a STATE that it advances
+//  one draw at a time (x_{n+1} = f(x_n)), which is inherently serial. On a GPU we
+//  instead want thread i to compute its i-th random number directly, with no
+//  shared state and no ordering. A *counter-based* RNG does exactly that: treat
+//  (seed, idx) as a counter and run it through a strong integer hash; the output
+//  bits are statistically random and independent across idx. This is the design
+//  behind cuRAND's Philox; we hand-roll the well-known splitmix64 finalizer to
+//  keep the repo dependency-free.
+//
+//  Steps:
+//    1. Combine (seed, idx) into one 64-bit key. Multiplying seed by an odd
+//       constant (the golden-ratio mix) before adding idx decorrelates nearby
+//       (seed, idx) pairs so adjacent threads don't get similar streams.
+//    2. Run the splitmix64 avalanche (xor-shift / multiply rounds) so every input
+//       bit influences ~half the output bits — turning the structured counter
+//       into well-distributed bits.
+//    3. Take 24 high bits and scale by 2^-24 to land in [0, 1) with full float
+//       mantissa precision. (High bits are used because they have the best
+//       statistical quality in such mixers.)
+//
+//  NOTE: this is a fast, reproducible RNG good for dropout/initialization — it is
+//  NOT cryptographically secure and is not claimed to pass every statistical test.
+//  __forceinline__ asks the compiler to inline it into the kernels that call it.
+__device__ __forceinline__ float rng_uniform(unsigned long long seed,
+                                              unsigned int idx) {
+    // 1) Mix seed and index into a single 64-bit key.
+    unsigned long long k = seed * 0x9E3779B97F4A7C15ULL  // golden-ratio odd const
+                         + (unsigned long long)idx;
+    // 2) splitmix64 finalizer (avalanche): scramble all the bits.
+    k ^= k >> 30; k *= 0xBF58476D1CE4E5B9ULL;
+    k ^= k >> 27; k *= 0x94D049BB133111EBULL;
+    k ^= k >> 31;
+    // 3) Use the top 24 bits as the mantissa of a float in [0, 1).
+    //    (k >> 40) keeps bits [40..63] = 24 bits; * 2^-24 maps {0..2^24-1} -> [0,1).
+    unsigned int bits = (unsigned int)(k >> 40);
+    return (float)bits * (1.0f / 16777216.0f);   // 16777216 = 2^24
+}
+
+// =============================================================================
+// 17) fill_uniform  —  out[i] = uniform random in [0, 1), from rng_uniform.
+// =============================================================================
+//
+// A thin element-wise kernel exposing the RNG directly. main.cu uses it for a
+// self-test (fill an array, then reduce_sum to check the mean ≈ 0.5), which both
+// demonstrates the generator and exercises the push-0002 reduction.
+__global__ void fill_uniform(float* out, int n, unsigned long long seed) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;   // flat element index
+    if (i >= n) return;                              // guard padding threads
+    out[i] = rng_uniform(seed, (unsigned int)i);     // independent per index
+}
+
+// ---- launch_fill_uniform: 1-D launch over n elements. -----------------------
+void launch_fill_uniform(float* out, int n, unsigned long long seed) {
+    int block = kBlockSize;
+    int grid  = ceil_div(n, block);
+    fill_uniform<<<grid, block>>>(out, n, seed);
+    CUDA_CHECK_LAST();
+}
+
+// =============================================================================
+// 18) dropout_forward  —  inverted dropout: zero with prob p, scale survivors.
+// =============================================================================
+//
+// WHAT/WHY: see the header banner. For element i: draw u = uniform(seed, i); if
+// u >= p keep it (scaled by 1/(1-p)), else drop it (0). The scaled multiplier is
+// stored in `mask` so the backward pass can reuse the exact same pattern. Because
+// the mask depends only on (seed, i) — not on the data — a fixed seed makes this
+// deterministic, which is what the gradient check relies on.
+//
+// SHAPES: in/out/mask are flat length n. `in` may alias `out` (each thread reads
+// in[i] before writing out[i], so in-place is safe).
+__global__ void dropout_forward(const float* in, float* out, float* mask,
+                                int n, float keep_scale, float p,
+                                unsigned long long seed) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;   // flat element index
+    if (i >= n) return;                              // guard padding threads
+    float u = rng_uniform(seed, (unsigned int)i);    // this element's random draw
+    // keep_scale if kept (u >= p), else 0. Branchless via the ternary -> predicated.
+    float m = (u >= p) ? keep_scale : 0.0f;
+    mask[i] = m;                                      // cache the scaled mask
+    out[i]  = in[i] * m;                             // apply it
+}
+
+// ---- launch_dropout_forward: compute the survivor scale, then 1-D launch. ----
+void launch_dropout_forward(const float* in, float* out, float* mask,
+                            int n, float p, unsigned long long seed) {
+    // Inverted-dropout survivor scale. p is assumed in [0,1); p<1 so (1-p)>0.
+    float keep_scale = 1.0f / (1.0f - p);
+    int block = kBlockSize;
+    int grid  = ceil_div(n, block);
+    dropout_forward<<<grid, block>>>(in, out, mask, n, keep_scale, p, seed);
+    CUDA_CHECK_LAST();
+}
+
+// =============================================================================
+// 19) dropout_backward  —  grad_in[i] = grad_out[i] * mask[i].
+// =============================================================================
+//
+// WHAT/WHY: reuse the cached scaled mask from the forward. Dropped units (mask 0)
+// block the gradient; survivors pass it through with the same 1/(1-p) scale. No
+// RNG needed — the pattern is fixed in `mask`. grad_out may alias grad_in.
+//
+// SHAPES: grad_out/mask/grad_in flat length n.
+__global__ void dropout_backward(const float* grad_out, const float* mask,
+                                 float* grad_in, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;   // flat element index
+    if (i >= n) return;                              // guard padding threads
+    grad_in[i] = grad_out[i] * mask[i];              // gate by the cached mask
+}
+
+// ---- launch_dropout_backward: 1-D launch over n elements. -------------------
+void launch_dropout_backward(const float* grad_out, const float* mask,
+                             float* grad_in, int n) {
+    int block = kBlockSize;
+    int grid  = ceil_div(n, block);
+    dropout_backward<<<grid, block>>>(grad_out, mask, grad_in, n);
+    CUDA_CHECK_LAST();
+}

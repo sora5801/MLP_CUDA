@@ -506,3 +506,100 @@ __global__ void predictions_correct(const float* probs, const int* labels,
 // Host wrapper: 1-D launch over `rows`, then CUDA_CHECK_LAST().
 void launch_predictions_correct(const float* probs, const int* labels,
                                 float* correct, int rows, int cols);
+
+
+// ============================================================================
+// ============================================================================
+//  ADDED IN PUSH 0003 — on-device random numbers + dropout regularization.
+//  See docs/changelog/0003-*.md and the "On-device RNG" section in
+//  docs/cuda_concepts.md.
+// ============================================================================
+// ============================================================================
+
+
+// ============================================================================
+// 17) fill_uniform — out[i] = a uniform random float in [0, 1).
+// ----------------------------------------------------------------------------
+// Demonstrates a COUNTER-BASED (stateless) GPU RNG: instead of each thread
+// advancing a shared/per-thread RNG state (which needs storage and careful
+// seeding), every element's value is a hash of (seed, index):
+//     out[i] = uniform( hash(seed, i) )
+// There is NO state to store and NO synchronization — thread i independently
+// computes its own number — yet results are fully reproducible given (seed, i).
+// This is exactly the idea behind cuRAND's Philox generator; here we hand-roll a
+// small splitmix64-style integer hash (see src/kernels.cu) to stay dependency-
+// free. Used by the RNG self-test in main.cu, and the same hash drives dropout.
+//
+// Parameters:
+//   out  : output array, length n, filled with uniforms in [0,1). GPU global mem.
+//   n    : number of elements.
+//   seed : 64-bit seed; change it to get an independent stream of numbers.
+//
+// Launch config: the standard 1-D element-wise grid (kBlockSize threads/block).
+// ============================================================================
+__global__ void fill_uniform(float* out, int n, unsigned long long seed);
+
+// Host wrapper: 1-D launch over n elements, then CUDA_CHECK_LAST().
+void launch_fill_uniform(float* out, int n, unsigned long long seed);
+
+
+// ============================================================================
+// 18) dropout_forward — "inverted dropout": randomly zero, scale the survivors.
+// ----------------------------------------------------------------------------
+// Dropout is a regularizer: during TRAINING it randomly sets each activation to
+// 0 with probability p (so the network can't rely on any single unit), which
+// reduces overfitting. The surviving activations are scaled UP by 1/(1-p) so the
+// expected value of each activation is unchanged — that is "inverted dropout",
+// and its payoff is that INFERENCE needs no dropout and no rescaling at all.
+//
+// Per element i, using the same counter-based RNG as fill_uniform:
+//     u        = uniform(seed, i)
+//     keep     = (u >= p)                      // dropped with probability p
+//     mask[i]  = keep ? (1/(1-p)) : 0          // the SCALED multiplier
+//     out[i]   = in[i] * mask[i]
+// The scaled mask is written out and CACHED so dropout_backward can reuse the
+// exact same pattern (gradients must flow only through the kept units).
+//
+// REPRODUCIBILITY MATTERS: because the mask depends only on (seed, i) — NOT on
+// the activations or weights — holding `seed` fixed makes dropout a deterministic
+// function of the inputs. That is what lets the finite-difference gradient check
+// validate the dropout backward pass (mlp_grad_check freezes the RNG seed).
+//
+// Parameters:
+//   in         : input activations, length n. May alias out (in-place safe).
+//   out        : output activations, length n (in[i]*mask[i]).
+//   mask       : output cached scaled mask, length n (reused by the backward).
+//   n          : total elements (batch * out_features).
+//   keep_scale : the survivor scale 1/(1-p) (the launcher computes it from p).
+//   p          : drop probability in [0,1).
+//   seed       : per-call RNG seed (varies the mask across training steps).
+// ============================================================================
+__global__ void dropout_forward(const float* in, float* out, float* mask,
+                                int n, float keep_scale, float p,
+                                unsigned long long seed);
+
+// Host wrapper: computes keep_scale = 1/(1-p), then 1-D launch over n elements.
+void launch_dropout_forward(const float* in, float* out, float* mask,
+                            int n, float p, unsigned long long seed);
+
+
+// ============================================================================
+// 19) dropout_backward — grad_in[i] = grad_out[i] * mask[i].
+// ----------------------------------------------------------------------------
+// Backprop through dropout simply reuses the SCALED mask cached during the
+// forward pass: dropped units (mask 0) receive zero gradient, survivors receive
+// the upstream gradient scaled by the same 1/(1-p). No RNG is needed here — the
+// pattern is already fixed in `mask`. This is why the forward caches the mask.
+//
+// Parameters:
+//   grad_out : upstream gradient, length n. May alias grad_in (in-place safe).
+//   mask     : the scaled mask cached by dropout_forward, length n.
+//   grad_in  : output gradient, length n (grad_out[i] * mask[i]).
+//   n        : total elements (batch * out_features).
+// ============================================================================
+__global__ void dropout_backward(const float* grad_out, const float* mask,
+                                 float* grad_in, int n);
+
+// Host wrapper: 1-D launch over n elements, then CUDA_CHECK_LAST().
+void launch_dropout_backward(const float* grad_out, const float* mask,
+                             float* grad_in, int n);

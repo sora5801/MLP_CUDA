@@ -64,6 +64,12 @@ Repeat over many batches/epochs and the loss falls / accuracy rises.
   Tanh's backward needs the *post*-activation while ReLU's needs the *pre*-one.
 - **(push 0002) Train/validation split + inference-only evaluation** to measure
   generalization on held-out data.
+- **(push 0003) On-device RNG** — a hand-written **counter-based** generator
+  (`random = hash(seed, index)`, no per-thread state, the Philox idea), with a
+  self-test that reduces ~1M samples to a mean ≈ 0.5.
+- **(push 0003) Dropout + train/inference modes** — inverted dropout built on that
+  RNG, plus the train/eval switch it forces; and why a *reproducible* mask is what
+  lets you gradient-check a stochastic layer.
 
 ---
 
@@ -96,7 +102,8 @@ MLP_CUDA/
     └── changelog/
         ├── README.md           The per-push changelog convention.
         ├── 0001-initial-implementation.md            The first push.
-        └── 0002-optimizers-activations-reduction.md  This push.
+        ├── 0002-optimizers-activations-reduction.md  Optimizers/activations/reduction.
+        └── 0003-on-device-rng-and-dropout.md         RNG + dropout (this push).
 ```
 
 ---
@@ -232,6 +239,7 @@ whichever you choose**:
 | `kHiddenAct` | `Activation::ReLU` (default) · `Activation::LeakyReLU` · `Activation::Tanh` |
 | `optim_create(net, …)` | `opt_adam(0.01f)` (default) · `opt_momentum(0.1f, 0.9f)` · `opt_sgd(0.1f)` |
 | `kValSamples` | size of the held-out validation split (default 192) |
+| `kDropoutP` *(0003)* | hidden-layer dropout probability (default `0.2`; `0.0` disables) |
 
 Note Adam's learning rate (~`0.01`) is intentionally smaller than SGD's (~`0.1`)
 because Adam normalizes each step by the gradient's running RMS.
@@ -252,7 +260,15 @@ When it runs you should see (numbers will vary slightly by GPU and seed, but the
    GEMM 512x512x512:  naive = 1.83 ms   tiled = 0.71 ms   speedup = 2.58x
    ```
 
-3. **Gradient check** — small **relative errors** (roughly `1e-3` or smaller for
+3. **(push 0003) RNG self-test** — ~1M on-device uniforms reduced to a mean near
+   0.5, confirming the counter-based generator that powers dropout:
+
+   ```
+   counter-based RNG: 1048576 uniforms in [0,1), seed=1234567
+     mean : 0.50000   (expected ~0.5 for uniform[0,1))
+   ```
+
+4. **Gradient check** — small **relative errors** (roughly `1e-3` or smaller for
    a central difference with `eps = 1e-3`), confirming the analytic backward
    pass matches the numerical gradient:
 
@@ -261,22 +277,24 @@ When it runs you should see (numbers will vary slightly by GPU and seed, but the
    ...
    ```
 
-4. **Training** — the chosen optimizer's name, then the **loss decreasing** and
-   **train accuracy rising** over the epochs. With the default Adam optimizer on
-   this easy dataset it converges within a few epochs, e.g.:
+5. **Training** — the optimizer name, dropout rate, then the **loss decreasing**
+   and **train accuracy rising**. With the default Adam optimizer on this easy
+   dataset it converges within a few epochs (with `kDropoutP>0` the train loss
+   stays slightly noisy — the visible signature of dropout), e.g.:
 
    ```
-   ==================== TRAINING (Adam, lr=0.01) ==========
-   epoch  1/60  loss 0.3890  train_acc 0.873
+   ==================== TRAINING (Adam, lr=0.01, dropout=0.20) =====
+   epoch  1/60  loss 0.4865  train_acc 0.840
    epoch 10/60  loss 0.0001  train_acc 1.000
    ...
    epoch 60/60  loss 0.0000  train_acc 1.000
    ```
 
-5. **Throughput** — total training time and samples/second (CUDA-event timed).
-6. **(push 0002) Validation** — held-out loss/accuracy on the data the optimizer
-   never trained on, e.g. `held-out val: loss 0.0000  acc 1.000`. Close to the
-   train accuracy ⇒ the model generalized (this dataset is easily separable).
+6. **Throughput** — total training time and samples/second (CUDA-event timed).
+7. **Validation (push 0002)** — held-out loss/accuracy on the data the optimizer
+   never trained on, evaluated in **inference mode** (dropout off), e.g.
+   `held-out val: loss 0.0000  acc 1.000`. Close to the train accuracy ⇒ the model
+   generalized (this dataset is easily separable).
 
 ---
 

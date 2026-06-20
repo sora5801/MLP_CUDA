@@ -421,6 +421,49 @@ Two things to internalize:
   kind of mistake the gradient check (§7) catches. This is *why* every `Layer`
   caches both `Z` and `A`.
 
+### 4.6 Dropout — training-time regularization   [added in push 0003]
+
+Dropout fights overfitting by randomly removing hidden units during training, so
+the network cannot lean on any single unit. The repo uses **inverted dropout**:
+scale the survivors up during training so that *inference is an ordinary forward
+pass* with nothing to undo.
+
+**Forward (training).** For each hidden activation element `a` (a value of `A`),
+draw a uniform `u` from the on-device RNG and form a scaled keep-mask `m`:
+
+```
+u  = uniform(seed, i)          # in [0,1), from the counter-based RNG (cuda_concepts §7c)
+m  = (u >= p) ? 1/(1-p) : 0    # cached "scaled mask"
+ã  = a · m                     # dropped (0) or kept-and-amplified
+```
+
+The amplification makes the expectation unchanged:
+`E[ã] = (1-p)·(a/(1-p)) + p·0 = a`. That is the whole point of *inverted* dropout
+— since the training-time mean already equals `a`, **test time needs no scaling**,
+so inference just skips dropout. Implemented by **[`dropout_forward`]**.
+
+**Backward.** Once the mask is drawn, dropout is a fixed elementwise scaling, so
+
+```
+dL/da = dL/dã · m
+```
+
+— multiply the upstream gradient by the *same cached mask* `m`. Dropped units
+(`m=0`) receive zero gradient; survivors keep the `1/(1-p)` factor. Implemented by
+**[`dropout_backward`]** (no RNG — the pattern is fixed in `m`).
+
+**Ordering and the pure-`A` rule.** Forward is *activation → dropout*
+(`a = act(z)`, then `ã = a·m`), so backward is *dropout → activation derivative*.
+Since Tanh's backward needs the pure `a = tanh(z)` (§4.5), the repo keeps `A` pure
+and writes `ã` into a separate `A_out` buffer; `mlp_backward` applies
+`dropout_backward` to the incoming gradient *before* the activation derivative.
+
+**Why it is gradient-checkable.** `m` depends only on `(seed, index)`, never on the
+data, so with the seed held fixed (which `mlp_grad_check` does) dropout is a
+deterministic function — the finite-difference check sees the identical mask on
+every ±ε forward pass and matches the analytic gradient. See `cuda_concepts.md`
+§7c for the RNG itself.
+
 --------------------------------------------------------------------------------
 ## 5. Backward driver (chaining layers)
 
@@ -566,8 +609,11 @@ produced by the kernels must match calculus, and the grad-check proves they do.
 | Upd  | Adam moment/bias-corrected step                       | `adam_update`                        | §6.2   |
 | Misc | `Σ` over an array (loss/accuracy on GPU)             | `reduce_sum_kernel`                  | —      |
 | Misc | per-row `argmax == label`                             | `predictions_correct`                | —      |
+| Fwd  | `ã = a · m`,  `m = u≥p ? 1/(1-p) : 0` (dropout)       | `dropout_forward`                    | §4.6   |
+| Bwd  | `dL/da = dL/dã · m`  (dropout)                        | `dropout_backward`                   | §4.6   |
+| RNG  | `u = uniform(hash(seed, i))`                          | `fill_uniform` / `rng_uniform`       | §4.6   |
 
 Read this table top-to-bottom for a forward pass, then bottom region (Bwd) from
 `cross_entropy_grad` upward for a backward pass — that ordering mirrors the
-driver loops in `src/mlp.cu`. (The §4.5/§6.1/§6.2 rows and the two Misc kernels
-were added in push 0002.)
+driver loops in `src/mlp.cu`. (The §4.5/§6.1/§6.2 rows and the Misc kernels were
+added in push 0002; the dropout/RNG rows in push 0003.)

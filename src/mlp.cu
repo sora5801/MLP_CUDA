@@ -70,12 +70,16 @@ static constexpr float kLeakyAlpha = 0.01f;
 //  stays ~constant across layers, which keeps gradients from vanishing/exploding
 //  early in training. `in` is the fan-in (number of inputs to the neuron).
 MLP mlp_create(const int* layer_sizes, int num_sizes, int batch_size,
-               unsigned long long seed, Activation hidden_act) {
+               unsigned long long seed, Activation hidden_act, float dropout_p) {
     MLP net;
     net.num_layers      = num_sizes - 1;          // edges between the size nodes
     net.batch_size      = batch_size;
     net.input_features  = layer_sizes[0];         // width of the input stage
     net.num_classes     = layer_sizes[num_sizes - 1]; // width of the final stage
+    // (push 0003) Start in TRAINING mode; seed the dropout RNG counter. The
+    // training loop advances rng_state each step; mlp_grad_check freezes it.
+    net.training        = true;
+    net.rng_state       = seed;
 
     // Allocate the array of Layer structs on the HOST. The Matrix members inside
     // each Layer hold *device* pointers, but the Layer structs themselves are
@@ -96,6 +100,9 @@ MLP mlp_create(const int* layer_sizes, int num_sizes, int batch_size,
         // there regardless of this field.
         L.is_output    = (l == net.num_layers - 1);
         L.activation   = hidden_act;
+        // (push 0003) Dropout applies to hidden layers only; the output (softmax)
+        // layer never drops. p==0 makes dropout a no-op (skipped in mlp_forward).
+        L.dropout_p    = L.is_output ? 0.0f : dropout_p;
 
         const int in  = L.in_features;
         const int out = L.out_features;
@@ -112,6 +119,12 @@ MLP mlp_create(const int* layer_sizes, int num_sizes, int batch_size,
         L.db = matrix_alloc(1, out);          // dL/db   [1,   out]
         L.dZ = matrix_alloc(batch_size, out); // dL/dZ   [batch, out]
         L.dA = matrix_alloc(batch_size, out); // dL/dA   [batch, out]
+        // (push 0003) Cached dropout mask + the post-dropout layer output, both
+        // same shape as the activation A. `A` stays the PURE activation; `A_out`
+        // holds act(Z)∘mask when dropout fires this pass.
+        L.dropout_mask = matrix_alloc(batch_size, out); // [batch, out]
+        L.A_out        = matrix_alloc(batch_size, out); // [batch, out]
+        L.dropped      = false;                          // set per forward pass
 
         // --- He-initialize the weights on the host, then copy to the device --
         // stddev = sqrt(2 / fan_in). Mean 0. (See WHY note above.)
@@ -153,11 +166,23 @@ void mlp_free(MLP& net) {
             matrix_free(L.db);
             matrix_free(L.dZ);
             matrix_free(L.dA);
+            matrix_free(L.dropout_mask);   // (push 0003)
+            matrix_free(L.A_out);          // (push 0003)
         }
         delete[] net.layers;   // host array allocated with new[] in mlp_create
         net.layers = nullptr;
     }
     net.num_layers = 0;
+}
+
+// ----------------------------------------------------------------------------
+//  mlp_set_training                                          (added in push 0003)
+// ----------------------------------------------------------------------------
+//  Flip between training (dropout active) and inference (dropout = identity). One
+//  flag is enough because we use inverted dropout (survivors pre-scaled during
+//  training), so inference needs no compensating rescale.
+void mlp_set_training(MLP& net, bool training) {
+    net.training = training;
 }
 
 // ----------------------------------------------------------------------------
@@ -208,6 +233,7 @@ void mlp_forward(MLP& net, const Matrix& batch_input) {
         // distribution per row (softmax); hidden layers apply elementwise ReLU.
         if (L.is_output) {
             launch_softmax_rows(L.Z.data, L.A.data, batch, out);
+            L.dropped = false;   // (push 0003) output layer never uses dropout
         } else {
             // Hidden layer: dispatch on the configured activation (push 0002).
             // All of these are purely elementwise, so we treat Z/A as flat arrays
@@ -224,10 +250,28 @@ void mlp_forward(MLP& net, const Matrix& batch_input) {
                     launch_tanh_forward(L.Z.data, L.A.data, m);
                     break;
             }
+
+            // (push 0003) Dropout, applied AFTER the activation (we drop POST-
+            // activation units) and ONLY in training mode. We keep `A` as the PURE
+            // activation act(Z) and write the dropped result into `A_out`, so that
+            // Tanh's backward can still read a = tanh(Z) from the un-dropped `A`.
+            // The per-layer seed is derived from rng_state so different layers get
+            // different masks, and — crucially — a FIXED rng_state reproduces the
+            // masks across forward passes, which is what makes the dropout layer
+            // gradient-checkable (mlp_grad_check freezes rng_state).
+            L.dropped = (net.training && L.dropout_p > 0.0f);
+            if (L.dropped) {
+                unsigned long long layer_seed =
+                    net.rng_state +
+                    (unsigned long long)(l + 1) * 0x9E3779B97F4A7C15ULL;
+                launch_dropout_forward(L.A.data, L.A_out.data, L.dropout_mask.data,
+                                       m, L.dropout_p, layer_seed);
+            }
         }
 
-        // The output of this layer becomes the input to the next.
-        prev = &L.A;
+        // This layer's OUTPUT (fed to the next layer's GEMM) is the pure activation
+        // `A`, or the dropped `A_out` when dropout fired this pass.
+        prev = L.dropped ? &L.A_out : &L.A;
     }
 }
 
@@ -281,10 +325,14 @@ void mlp_backward(MLP& net, const Matrix& batch_input, const int* d_labels) {
         const int in  = L.in_features;
         const int out_f = L.out_features;
 
-        // A_prev is what fed THIS layer in the forward pass: the raw input for
-        // layer 0, otherwise the previous layer's post-activation A.
-        const Matrix& prev_act = (l == 0) ? batch_input
-                                          : net.layers[l - 1].A;
+        // A_prev is the OUTPUT that fed THIS layer in the forward pass: the raw
+        // input for layer 0, otherwise the previous layer's output — which is its
+        // post-dropout A_out when it dropped this pass, else its pure activation A.
+        // (push 0003: must match exactly what the forward GEMM consumed.)
+        const Matrix& prev_act =
+            (l == 0) ? batch_input
+                     : (net.layers[l - 1].dropped ? net.layers[l - 1].A_out
+                                                   : net.layers[l - 1].A);
 
         // dW = A_prev^T · dZ.   M=in, N=out, K=batch.  transA=true, transB=false.
         // prev_act is physically [batch,in]; transA=true makes launch_gemm read
@@ -310,6 +358,19 @@ void mlp_backward(MLP& net, const Matrix& batch_input, const int* d_labels) {
                         /*M=*/batch, /*N=*/in, /*K=*/out_f,
                         /*transA=*/false, /*transB=*/true);
 
+            const int m_prev = batch * prevL.out_features;
+
+            // (push 0003) If layer l-1 applied dropout in the forward pass, undo it
+            // FIRST: multiply the upstream gradient (currently dL/d(A_out)) by the
+            // SAME cached scaled mask, so dropped units get 0 gradient and survivors
+            // keep the 1/(1-p) scale. This yields dL/d(pure A), which the activation
+            // derivative below converts to dZ. In place on prevL.dA. Order mirrors
+            // the forward (activation → dropout), so backward is (dropout → activation).
+            if (prevL.dropped) {
+                launch_dropout_backward(prevL.dA.data, prevL.dropout_mask.data,
+                                        prevL.dA.data, m_prev);
+            }
+
             // dZ_prev = dA_prev ⊙ act'(Z_prev): turn the gradient wrt the previous
             // layer's OUTPUT (dA) into the gradient wrt its PRE-activation (dZ) by
             // multiplying through the activation derivative. Dispatch on the
@@ -318,8 +379,8 @@ void mlp_backward(MLP& net, const Matrix& batch_input, const int* d_labels) {
             //   - Tanh uses the POST-activation A_prev, because tanh'(z)=1-a^2 is
             //     written in terms of a=tanh(z). Passing the wrong tensor here is
             //     a classic, silent backprop bug — the grad-check would catch it.
-            // Treated as a flat array of batch*prevL.out_features elements.
-            const int m_prev = batch * prevL.out_features;
+            // Treated as a flat array of batch*prevL.out_features elements
+            // (m_prev was computed above, before the dropout-backward step).
             switch (prevL.activation) {
                 case Activation::ReLU:
                     launch_relu_backward(prevL.dA.data, prevL.Z.data,
@@ -492,6 +553,12 @@ void mlp_evaluate(MLP& net, const float* X, const int* y, int n_samples,
         return;
     }
 
+    // (push 0003) Evaluate in INFERENCE mode so dropout is the identity (inverted
+    // dropout means no rescaling is needed at test time). Save and restore the
+    // caller's mode so this function has no lasting side effect on `net`.
+    const bool prev_training = net.training;
+    net.training = false;
+
     // Reusable device scratch for one batch of features + its labels.
     Matrix d_batch  = matrix_alloc(batch, in_f);
     int*   d_labels = nullptr;
@@ -518,6 +585,7 @@ void mlp_evaluate(MLP& net, const float* X, const int* y, int n_samples,
     out_loss = static_cast<float>(loss_sum / n_batches);
     out_acc  = static_cast<float>(acc_sum  / n_batches);
 
+    net.training = prev_training;   // (push 0003) restore the caller's mode
     matrix_free(d_batch);
     CUDA_CHECK(cudaFree(d_labels));
 }

@@ -21,6 +21,7 @@ open beside `src/kernels.cu`.
 6. [Memory coalescing](#6-memory-coalescing)
 7. [Shared memory & tiling (`gemm_tiled`)](#7-shared-memory--tiling-gemm_tiled)
 7b. [Parallel reduction (`reduce_sum`) — push 0002](#7b-parallel-reduction-reduce_sum--push-0002)
+7c. [On-device RNG (`rng_uniform`, dropout) — push 0003](#7c-on-device-rng-rng_uniform-dropout--push-0003)
 8. [Thread divergence (ReLU & guards)](#8-thread-divergence-relu--guards)
 9. [Numerical stability (softmax max-subtraction)](#9-numerical-stability-softmax-max-subtraction)
 10. [Synchronization (`__syncthreads`, `cudaDeviceSynchronize`)](#10-synchronization-__syncthreads-cudadevicesynchronize)
@@ -432,6 +433,63 @@ single preallocated scratch reused across calls.)
 
 ---
 
+## 7c. On-device RNG (`rng_uniform`, dropout) — push 0003
+
+Generating random numbers *on the GPU* needs a different mindset than on a CPU. A
+classic CPU generator keeps a **state** and advances it one draw at a time
+(`x_{n+1} = f(x_n)`) — inherently serial, and awkward when thousands of threads
+each want their own numbers. The GPU-friendly answer is a **counter-based RNG**:
+make each random value a pure function of *where* it is, with no state to advance
+and no coordination between threads.
+
+### The idea: `random = hash(seed, index)`
+
+```c++
+// src/kernels.cu — hash (seed, idx) -> uniform float in [0,1)
+__device__ __forceinline__ float rng_uniform(unsigned long long seed,
+                                              unsigned int idx) {
+    unsigned long long k = seed * 0x9E3779B97F4A7C15ULL + idx;  // mix seed & index
+    k ^= k >> 30; k *= 0xBF58476D1CE4E5B9ULL;                   // splitmix64
+    k ^= k >> 27; k *= 0x94D049BB133111EBULL;                   //   avalanche
+    k ^= k >> 31;
+    return (float)(unsigned int)(k >> 40) * (1.0f / 16777216.0f); // top 24 bits / 2^24
+}
+```
+
+Thread `i` calls `rng_uniform(seed, i)` and gets *its* number directly — order
+doesn't matter, there's no shared state, and nothing needs `__syncthreads`. This
+is exactly how cuRAND's Philox generator works; we hand-roll the well-known
+splitmix64 bit-mixer to stay dependency-free. Properties worth noting:
+
+- **Stateless & embarrassingly parallel.** Perfect for a GPU: no contention, no
+  serialization, scales to any number of elements.
+- **Reproducible.** Same `(seed, index)` ⇒ same value, always. Change `seed` to get
+  an independent stream. `fill_uniform` exposes this directly, and `main.cu`'s
+  self-test fills ~1M values and reduces them (using §7b) to a mean ≈ 0.5.
+- **Not cryptographic.** Fast and well-distributed enough for ML, but not designed
+  to resist prediction or pass every statistical test.
+
+### Why this is perfect for dropout
+
+`dropout_forward` uses the same hash to decide, per activation, whether to keep it:
+`u = rng_uniform(seed, i); keep = u >= p`. Two GPU-relevant payoffs:
+
+- **No mask storage between steps.** The mask is recomputed from `(seed, index)`
+  on demand, not stored across iterations.
+- **Reproducibility makes a *stochastic* layer gradient-checkable.** Because the
+  mask depends only on `(seed, index)` — never on the weights or data — holding the
+  seed fixed makes dropout deterministic. `mlp_grad_check` freezes `rng_state`, so
+  every ±ε forward pass regenerates the identical mask and the finite-difference
+  gradient matches the analytic one. The training loop instead advances `rng_state`
+  once per step to draw a fresh mask each time. (The dropout math is in
+  `docs/math_derivation.md` §4.6.)
+
+This also introduces **train vs inference mode** (`MLP::training`): dropout fires
+only in training; inference (`mlp_evaluate`) flips the flag off, and because the
+dropout is *inverted* (survivors pre-scaled), no other change is needed at test time.
+
+---
+
 ## 8. Thread divergence (ReLU & guards)
 
 All 32 threads in a warp share one instruction pointer (SIMT execution). When a
@@ -644,6 +702,8 @@ orchestrated by `src/mlp.cu` per the algorithms in `include/mlp.cuh`):
 | `reduce_sum_kernel` (0002) | multi-pass tree  | parallel reduction (§7b), shared mem + `__syncthreads` |
 | `predictions_correct` (0002) | 1-D grid, 1 thr/row | per-row argmax for device-side accuracy   |
 | `momentum_update` / `adam_update` (0002) | 1-D grid over params | optimizer state in device buffers |
+| `fill_uniform` (0003) | 1-D grid over elements | counter-based RNG (§7c), `random=hash(seed,i)` |
+| `dropout_forward` / `dropout_backward` (0003) | 1-D grid over elements | RNG-driven mask (§7c), train/inference mode |
 
 A single training step (see `src/main.cu`) exercises nearly all of it:
 

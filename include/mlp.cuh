@@ -92,6 +92,25 @@ struct Layer {
                         //              then turned into dZ via the activation
                         //              derivative. (Output layer skips dA: its dZ
                         //              comes straight from cross_entropy_grad.)
+
+    // ---- dropout (push 0003; hidden layers only) ----------------------------
+    float  dropout_p;   // drop probability in [0,1). 0 disables dropout for this
+                        //   layer. The output layer always has 0.
+    Matrix dropout_mask;// [batch, out] cached SCALED mask from dropout_forward
+                        //   (1/(1-p) for kept units, 0 for dropped). Reused by
+                        //   dropout_backward so gradients flow only through kept
+                        //   units. Allocated like Z/A even when p==0 (then unused).
+    Matrix A_out;       // [batch, out] the layer's OUTPUT fed to the next layer.
+                        //   We keep `A` as the PURE activation act(Z) and write the
+                        //   post-dropout result here, so Tanh's backward (which
+                        //   needs a = tanh(Z)) can still read the un-dropped `A`.
+                        //   When no dropout is applied this pass, the output is just
+                        //   `A` and A_out is unused (see `dropped`).
+    bool   dropped;     // transient: did THIS forward pass apply dropout to this
+                        //   layer? Set in mlp_forward; read in mlp_backward to pick
+                        //   the right output buffer (A_out vs A) and to decide
+                        //   whether to run dropout_backward. (Not persistent state —
+                        //   just bookkeeping between a paired forward/backward.)
 };
 
 // ----------------------------------------------------------------------------
@@ -110,6 +129,18 @@ struct MLP {
     int batch_size;      // rows per minibatch; fixes the cache shapes [batch,*].
     int input_features;  // = layer_sizes[0]      : width of the input batch.
     int num_classes;     // = layer_sizes[last]   : width of the softmax output.
+
+    // ---- training vs inference mode + RNG (push 0003) -----------------------
+    bool training;       // true => dropout is active in mlp_forward; false =>
+                         //   inference (dropout becomes the identity). Toggle via
+                         //   mlp_set_training. Inverted dropout means inference
+                         //   needs no rescaling, so flipping this flag is enough.
+    unsigned long long rng_state; // counter feeding the dropout RNG. The training
+                         //   loop advances it once per step so each step draws a
+                         //   fresh mask; mlp_grad_check holds it FIXED so the mask
+                         //   is identical across its perturbed forward passes
+                         //   (that determinism is what makes grad-checking a
+                         //   stochastic dropout layer possible).
 };
 
 // ----------------------------------------------------------------------------
@@ -137,15 +168,31 @@ struct MLP {
 //                  for ReLU-family activations; for Tanh, Xavier/Glorot init
 //                  would be more principled, but He still trains fine here and we
 //                  keep one init path for simplicity (noted as an exercise).
+//    dropout_p   : (push 0003) drop probability applied to every HIDDEN layer's
+//                  activations during training (0 disables it; default keeps old
+//                  behavior). The output layer never uses dropout. The new MLP
+//                  starts in TRAINING mode (net.training = true) with rng_state
+//                  seeded from `seed`.
 //  Returns: a fully-allocated MLP (caller must later call mlp_free).
 MLP  mlp_create(const int* layer_sizes, int num_sizes, int batch_size,
                 unsigned long long seed,
-                Activation hidden_act = Activation::ReLU);
+                Activation hidden_act = Activation::ReLU,
+                float dropout_p = 0.0f);
 
 // Frees every device Matrix in every layer, frees the host `layers` array, and
 // zeroes the MLP's fields so the struct can't be accidentally reused. Mirrors
 // matrix_free's "free + null out" discipline at the network level.
 void mlp_free(MLP& net);
+
+// ----------------------------------------------------------------------------
+//  mlp_set_training                                          (added in push 0003)
+//  ----------------------------------------------------------------------------
+//  Switch the network between TRAINING mode (dropout active in mlp_forward) and
+//  INFERENCE mode (dropout becomes the identity). Because we use *inverted*
+//  dropout (survivors are pre-scaled by 1/(1-p) during training), inference needs
+//  no rescaling — flipping this one flag is the entire train/eval switch. The
+//  training loop sets true; mlp_evaluate sets false for the duration of the eval.
+void mlp_set_training(MLP& net, bool training);
 
 // ----------------------------------------------------------------------------
 //  mlp_forward
