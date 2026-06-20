@@ -907,3 +907,68 @@ void launch_dropout_backward(const float* grad_out, const float* mask,
     dropout_backward<<<grid, block>>>(grad_out, mask, grad_in, n);
     CUDA_CHECK_LAST();
 }
+
+// =============================================================================
+// =============================================================================
+//  ADDED IN PUSH 0006 — KERNEL FUSION (gemm_bias_act). See docs/changelog/0006.
+// =============================================================================
+// =============================================================================
+
+// =============================================================================
+// 20) gemm_bias_act — fused  Z = Ain·W + bias ;  Aout = act(Z)  in one kernel.
+// =============================================================================
+//
+// The matmul half is byte-for-byte the same shared-memory tiling as gemm_tiled
+// (see kernel #2 for the full tiling commentary). The new part is the EPILOGUE:
+// once a thread has accumulated its output element in the register `acc`, it adds
+// the bias and applies the activation right there, then writes Z (pre-activation)
+// and Aout (post-activation). No separate add_bias / activation kernels, and Z is
+// never bounced through global memory just to be read back — that is the fusion.
+__global__ void gemm_bias_act(const float* Ain, const float* W, const float* bias,
+                              float* Z, float* Aout,
+                              int M, int N, int K, int act_type, float alpha) {
+    const int TILE = kTileDim;
+    __shared__ float sA[TILE][TILE];   // a TILE×TILE chunk of Ain
+    __shared__ float sW[TILE][TILE];   // a TILE×TILE chunk of W
+
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int row = blockIdx.y * TILE + ty;   // m in [0,M) — output row (batch sample)
+    int col = blockIdx.x * TILE + tx;   // n in [0,N) — output col (output neuron)
+
+    // ---- Tiled matmul: acc = Σ_k Ain[row,k]·W[k,col] (identical to gemm_tiled) ----
+    float acc = 0.0f;
+    int numTiles = (K + TILE - 1) / TILE;
+    for (int t = 0; t < numTiles; ++t) {
+        int aCol = t * TILE + tx;
+        int wRow = t * TILE + ty;
+        sA[ty][tx] = (row < M && aCol < K) ? Ain[row * K + aCol] : 0.0f;
+        sW[ty][tx] = (wRow < K && col < N) ? W[wRow * N + col]   : 0.0f;
+        __syncthreads();
+        for (int k = 0; k < TILE; ++k) acc += sA[ty][k] * sW[k][tx];
+        __syncthreads();
+    }
+
+    // ---- FUSED EPILOGUE: bias + activation, all in-register, one write each. ----
+    if (row < M && col < N) {
+        float z = acc + bias[col];        // (1) add bias  -> pre-activation
+        Z[row * N + col] = z;             //     cache Z for the backward pass
+        float a;                          // (2) activation -> post-activation
+        switch (act_type) {
+            case 0: a = (z > 0.0f) ? z : 0.0f;          break;  // ReLU
+            case 1: a = (z > 0.0f) ? z : alpha * z;     break;  // LeakyReLU
+            case 2: a = tanhf(z);                       break;  // Tanh
+            default: a = z;                             break;  // Identity (output layer)
+        }
+        Aout[row * N + col] = a;
+    }
+}
+
+// ---- launch_gemm_bias_act: 2-D tiled launch covering [M,N]. ------------------
+void launch_gemm_bias_act(const float* Ain, const float* W, const float* bias,
+                          float* Z, float* Aout,
+                          int M, int N, int K, int act_type, float alpha) {
+    dim3 block(kTileDim, kTileDim);                          // 16×16 = 256 threads
+    dim3 grid(ceil_div(N, block.x), ceil_div(M, block.y));  // cover N (x) and M (y)
+    gemm_bias_act<<<grid, block>>>(Ain, W, bias, Z, Aout, M, N, K, act_type, alpha);
+    CUDA_CHECK_LAST();
+}

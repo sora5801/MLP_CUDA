@@ -35,6 +35,7 @@
 #include "dataset.cuh" // make_blobs / standardize / shuffle / split / free
 #include "optim.cuh"   // (push 0002) Optimizer: SGD / Momentum / Adam
 #include "stream_demo.cuh" // (push 0005) CUDA streams + double-buffering benchmark
+#include "fusion_demo.cuh"  // (push 0006) fused GEMM+bias+activation benchmark
 
 // -----------------------------------------------------------------------------
 // CONFIGURATION CONSTANTS (spec §2 src/main.cu, item 1)
@@ -307,6 +308,9 @@ int main() {
 
     // (push 0005) CUDA streams + double-buffering: overlap H2D copies with compute.
     run_stream_pipeline_demo();
+
+    // (push 0006) Kernel fusion: fused GEMM+bias+activation vs the unfused trio.
+    run_fusion_benchmark();
 
     // -------------------------------------------------------------------------
     // STEP 2: build the synthetic dataset on the HOST, then standardize it.

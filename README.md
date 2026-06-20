@@ -73,6 +73,9 @@ Repeat over many batches/epochs and the loss falls / accuracy rises.
 - **(push 0005) CUDA streams & double-buffering** — overlap host→device copies with
   compute using pinned memory + two streams; a benchmark (serial vs pipelined,
   pinned vs pageable) with verified-identical results.
+- **(push 0006) Kernel fusion** — a fused GEMM+bias+activation kernel that does the
+  whole forward linear layer in one launch (epilogue in registers); used by the real
+  forward pass, with a benchmark proving it matches the unfused result and is faster.
 
 ---
 
@@ -94,7 +97,8 @@ MLP_CUDA/
 │   ├── mlp.cuh                 Layer / MLP structs + the training-API decls.
 │   ├── dataset.cuh             Synthetic "blobs" dataset decls.
 │   ├── optim.cuh               (0002) SGD / Momentum / Adam optimizer API.
-│   └── stream_demo.cuh         (0005) streams + double-buffering benchmark decl.
+│   ├── stream_demo.cuh         (0005) streams + double-buffering benchmark decl.
+│   └── fusion_demo.cuh         (0006) fused GEMM+bias+activation benchmark decl.
 ├── src/
 │   ├── matrix.cu               Matrix helpers: alloc/free/zero/copy/bytes.
 │   ├── kernels.cu              ALL CUDA kernels + launchers — the heart of it.
@@ -102,6 +106,7 @@ MLP_CUDA/
 │   ├── dataset.cu              make_blobs, standardize, shuffle, split (host-side).
 │   ├── optim.cu                (0002) Momentum & Adam kernels + optim_create/step.
 │   ├── stream_demo.cu          (0005) streams + double-buffering benchmark impl.
+│   ├── fusion_demo.cu          (0006) fused-vs-unfused forward-layer benchmark.
 │   └── main.cu                 Entry point: data → build → train → validate.
 ├── demo/
 │   └── demo.cu                 (0004) Guided feature showcase; the VS entry point.
@@ -114,7 +119,8 @@ MLP_CUDA/
         ├── 0002-optimizers-activations-reduction.md  Optimizers/activations/reduction.
         ├── 0003-on-device-rng-and-dropout.md         RNG + dropout.
         ├── 0004-visual-studio-solution-and-demo.md   VS solution + demo.
-        └── 0005-cuda-streams-double-buffering.md     Streams + double-buffering (this push).
+        ├── 0005-cuda-streams-double-buffering.md     Streams + double-buffering.
+        └── 0006-fused-gemm-bias-activation.md        Kernel fusion (this push).
 ```
 
 ---

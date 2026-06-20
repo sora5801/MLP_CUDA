@@ -45,6 +45,18 @@
 // through the dispatch code below.
 static constexpr float kLeakyAlpha = 0.01f;
 
+// (push 0006) The fused gemm_bias_act kernel takes an int `act_type`; for hidden
+// layers we pass static_cast<int>(L.activation), so these enum values must equal
+// the kernel's expected codes (0=ReLU, 1=LeakyReLU, 2=Tanh; 3=Identity is the
+// output layer). This static_assert fails the build if the enum ever drifts.
+static_assert(static_cast<int>(Activation::ReLU) == 0 &&
+              static_cast<int>(Activation::LeakyReLU) == 1 &&
+              static_cast<int>(Activation::Tanh) == 2,
+              "fused act_type encoding must match enum class Activation");
+// act_type code the fused kernel uses for the output layer's (identity) epilogue;
+// softmax_rows is then applied to Z separately (softmax is row-wise, not fusable).
+static constexpr int kFusedIdentity = 3;
+
 // ----------------------------------------------------------------------------
 //  mlp_create
 // ----------------------------------------------------------------------------
@@ -204,10 +216,12 @@ void mlp_set_training(MLP& net, bool training) {
 //        A = is_output ? softmax(Z) : relu(Z)
 //        prev = A
 //
-//  GEMM shape bookkeeping for the linear step `Z = prev · W`:
-//    prev is [batch, in], W is [in, out], so Z is [batch, out]. In launch_gemm's
-//    (M, N, K) terms: M=batch (rows of C), N=out (cols of C), K=in (shared dim).
-//    No transposes — both operands are already stored in the natural orientation.
+//  (push 0006) The linear step Z = prev·W + b AND the activation A = act(Z) are
+//  computed by ONE fused kernel, launch_gemm_bias_act (replacing the old
+//  gemm + add_bias + activation sequence). Shape bookkeeping for the matmul:
+//  prev is [batch, in], W is [in, out], so Z is [batch, out] — M=batch, N=out,
+//  K=in, no transpose. The output layer uses the identity epilogue, then applies
+//  softmax over Z (softmax is row-wise and cannot be fused element-by-element).
 void mlp_forward(MLP& net, const Matrix& batch_input) {
     const int batch = net.batch_size;
 
@@ -220,52 +234,39 @@ void mlp_forward(MLP& net, const Matrix& batch_input) {
         const int in  = L.in_features;
         const int out = L.out_features;
 
-        // Z = prev · W            C[M,N]=A[M,K]·B[K,N] with M=batch,N=out,K=in.
-        // transA=false (prev stored [batch,in]), transB=false (W stored [in,out]).
-        launch_gemm(prev->data, L.W.data, L.Z.data,
-                    /*M=*/batch, /*N=*/out, /*K=*/in,
-                    /*transA=*/false, /*transB=*/false);
+        // (push 0006) FUSED forward linear layer: ONE kernel computes
+        //   Z = prev·W + b   AND   A = act(Z)
+        // replacing the old gemm + add_bias + activation trio (and the two extra
+        // global-memory round-trips of Z). M=batch, N=out, K=in; no transpose.
+        // For the OUTPUT layer we pass the identity epilogue and apply softmax to
+        // Z afterward (softmax is row-wise, so it cannot be fused per element).
+        const int act_type = L.is_output ? kFusedIdentity
+                                         : static_cast<int>(L.activation);
+        launch_gemm_bias_act(prev->data, L.W.data, L.b.data,
+                             L.Z.data, L.A.data,
+                             /*M=*/batch, /*N=*/out, /*K=*/in,
+                             act_type, kLeakyAlpha);
 
-        // Z[r,o] += b[o]  — broadcast the length-`out` bias across all batch rows.
-        launch_add_bias(L.Z.data, L.b.data, batch, out);
-
-        // Nonlinearity. The output layer turns logits into a probability
-        // distribution per row (softmax); hidden layers apply elementwise ReLU.
         if (L.is_output) {
+            // Z holds the logits (and A=Z from the identity epilogue); softmax_rows
+            // turns each row of logits into a class-probability distribution in A.
             launch_softmax_rows(L.Z.data, L.A.data, batch, out);
             L.dropped = false;   // (push 0003) output layer never uses dropout
         } else {
-            // Hidden layer: dispatch on the configured activation (push 0002).
-            // All of these are purely elementwise, so we treat Z/A as flat arrays
-            // of batch*out elements (the 2-D shape is irrelevant to act(x)).
-            const int m = batch * out;
-            switch (L.activation) {
-                case Activation::ReLU:
-                    launch_relu_forward(L.Z.data, L.A.data, m);
-                    break;
-                case Activation::LeakyReLU:
-                    launch_leaky_relu_forward(L.Z.data, L.A.data, m, kLeakyAlpha);
-                    break;
-                case Activation::Tanh:
-                    launch_tanh_forward(L.Z.data, L.A.data, m);
-                    break;
-            }
-
-            // (push 0003) Dropout, applied AFTER the activation (we drop POST-
-            // activation units) and ONLY in training mode. We keep `A` as the PURE
-            // activation act(Z) and write the dropped result into `A_out`, so that
-            // Tanh's backward can still read a = tanh(Z) from the un-dropped `A`.
-            // The per-layer seed is derived from rng_state so different layers get
-            // different masks, and — crucially — a FIXED rng_state reproduces the
-            // masks across forward passes, which is what makes the dropout layer
-            // gradient-checkable (mlp_grad_check freezes rng_state).
+            // (push 0003) Dropout, applied AFTER the (now fused) activation and
+            // ONLY in training mode. We keep `A` as the PURE activation act(Z) and
+            // write the dropped result into `A_out`, so Tanh's backward can still
+            // read a = tanh(Z) from the un-dropped `A`. The per-layer seed is
+            // derived from rng_state so different layers get different masks, and —
+            // crucially — a FIXED rng_state reproduces the masks across forward
+            // passes, which is what makes the dropout layer gradient-checkable.
             L.dropped = (net.training && L.dropout_p > 0.0f);
             if (L.dropped) {
                 unsigned long long layer_seed =
                     net.rng_state +
                     (unsigned long long)(l + 1) * 0x9E3779B97F4A7C15ULL;
                 launch_dropout_forward(L.A.data, L.A_out.data, L.dropout_mask.data,
-                                       m, L.dropout_p, layer_seed);
+                                       batch * out, L.dropout_p, layer_seed);
             }
         }
 

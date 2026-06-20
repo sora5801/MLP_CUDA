@@ -23,6 +23,7 @@ open beside `src/kernels.cu`.
 7b. [Parallel reduction (`reduce_sum`) — push 0002](#7b-parallel-reduction-reduce_sum--push-0002)
 7c. [On-device RNG (`rng_uniform`, dropout) — push 0003](#7c-on-device-rng-rng_uniform-dropout--push-0003)
 7d. [CUDA streams & double-buffering — push 0005](#7d-cuda-streams--double-buffering--push-0005)
+7e. [Kernel fusion (`gemm_bias_act`) — push 0006](#7e-kernel-fusion-gemm_bias_act--push-0006)
 8. [Thread divergence (ReLU & guards)](#8-thread-divergence-relu--guards)
 9. [Numerical stability (softmax max-subtraction)](#9-numerical-stability-softmax-max-subtraction)
 10. [Synchronization (`__syncthreads`, `cudaDeviceSynchronize`)](#10-synchronization-__syncthreads-cudadevicesynchronize)
@@ -554,6 +555,58 @@ mini-batch while the GPU trains on the current one.
 
 ---
 
+## 7e. Kernel fusion (`gemm_bias_act`) — push 0006
+
+Every kernel launch has a cost, and every kernel that touches a tensor must stream
+that whole tensor through global memory. **Kernel fusion** combines several
+operations into one kernel to pay those costs once. The forward linear layer is the
+poster child: it used to be three kernels —
+
+```
+gemm_tiled   : Z = prev · W        write Z          (to global memory)
+add_bias     : Z = Z + b           read Z, write Z  (a full pass over [M,N])
+relu_forward : A = relu(Z)         read Z, write A  (another full pass)
+```
+
+The bias add and the activation do almost no arithmetic, but each is a separate
+kernel that reads and writes the entire `[M,N]` output. `gemm_bias_act` (kernel #20,
+`src/kernels.cu`) **fuses** them into the matmul's epilogue: once a thread has
+accumulated its output element in a register, it adds the bias and applies the
+activation right there, then writes `Z` (for backprop) and `A` once each.
+
+```c++
+// after the tiled matmul leaves the result in register `acc`:
+float z = acc + bias[col];     // bias add — in register, no extra global pass
+Z[row*N + col] = z;            // one write of the pre-activation
+float a;                       // activation — in register
+switch (act_type) {            // 0 ReLU · 1 LeakyReLU · 2 Tanh · 3 Identity
+    case 0: a = (z > 0) ? z : 0;        break;
+    ...
+}
+A[row*N + col] = a;            // one write of the post-activation
+```
+
+What fusion buys here:
+
+- **Fewer global-memory round-trips.** `Z` is written once instead of
+  written-then-reread-twice; the bias and activation never touch global memory as
+  separate passes.
+- **Fewer launches.** One kernel instead of three — three times less launch latency,
+  which dominates for *small* layers (like this MLP's 64-wide ones, where each
+  matmul is only microseconds).
+
+The matmul half is identical to `gemm_tiled`, so the benchmark in `fusion_demo.cu`
+isolates exactly the fused-away cost: on a wide, shallow layer the fused kernel runs
+~1.4× faster and produces a bit-identical result. **Caveat (honest):** for a
+compute-bound *deep* matmul the epilogue is a tiny slice of the runtime and fusion
+saves proportionally little — the win is biggest when the output `[M,N]` is large
+relative to the contraction `K`, or when launch overhead dominates. `mlp_forward`
+uses the fused kernel; the output layer fuses GEMM+bias only (identity epilogue) and
+runs `softmax_rows` separately, because softmax needs a whole row and can't be fused
+element-by-element.
+
+---
+
 ## 8. Thread divergence (ReLU & guards)
 
 All 32 threads in a warp share one instruction pointer (SIMT execution). When a
@@ -769,6 +822,7 @@ orchestrated by `src/mlp.cu` per the algorithms in `include/mlp.cuh`):
 | `fill_uniform` (0003) | 1-D grid over elements | counter-based RNG (§7c), `random=hash(seed,i)` |
 | `dropout_forward` / `dropout_backward` (0003) | 1-D grid over elements | RNG-driven mask (§7c), train/inference mode |
 | `pipeline_compute` (0005) | 1-D grid, launched on a stream | streams + double-buffering (§7d); no per-launch sync |
+| `gemm_bias_act` (0006) | 2-D tiled grid | kernel fusion (§7e): matmul + bias + activation in one launch |
 
 A single training step (see `src/main.cu`) exercises nearly all of it:
 

@@ -40,6 +40,7 @@
 #include "dataset.cuh"  // make_blobs / standardize / shuffle / split
 #include "optim.cuh"    // SGD / Momentum / Adam
 #include "stream_demo.cuh" // (push 0005) CUDA streams + double-buffering benchmark
+#include "fusion_demo.cuh"  // (push 0006) fused GEMM+bias+activation benchmark
 
 // ---- Shared experiment configuration ---------------------------------------
 static constexpr unsigned long long kSeed   = 1234567ULL; // master RNG seed
@@ -236,6 +237,10 @@ int main() {
     // Overlap host->device batch copies with compute, comparing a serial pipeline
     // to a double-buffered one (pinned vs pageable host memory).
     run_stream_pipeline_demo();
+
+    // ---- 3c (push 0006): kernel fusion ----
+    // Fused GEMM+bias+activation vs the unfused three-kernel sequence.
+    run_fusion_benchmark();
 
     // ---- Build the dataset once: blobs -> standardize -> shuffle -> split ----
     Dataset data = make_blobs(kNPerClass, kNFeatures, kNClasses, kClusterStd, kSeed);

@@ -603,3 +603,56 @@ __global__ void dropout_backward(const float* grad_out, const float* mask,
 // Host wrapper: 1-D launch over n elements, then CUDA_CHECK_LAST().
 void launch_dropout_backward(const float* grad_out, const float* mask,
                              float* grad_in, int n);
+
+
+// ============================================================================
+// ============================================================================
+//  ADDED IN PUSH 0006 — KERNEL FUSION. One kernel does the whole forward linear
+//  layer (matmul + bias + activation) that used to take three.
+//  See docs/changelog/0006-*.md and docs/cuda_concepts.md ("Kernel fusion").
+// ============================================================================
+// ============================================================================
+
+
+// ============================================================================
+// 20) gemm_bias_act — FUSED linear layer:  Z = Ain·W + bias ;  Aout = act(Z).
+// ----------------------------------------------------------------------------
+// Fuses the THREE kernels the forward pass used to run per hidden layer — the
+// matmul (gemm_tiled), the bias add (add_bias), and the activation
+// (relu/leaky/tanh_forward) — into ONE. Each thread computes one output element
+//   C[m,n] = Σ_k Ain[m,k]·W[k,n]
+// via the same shared-memory tiling as gemm_tiled, then — while that value is
+// still in a REGISTER — adds bias[n] and applies the activation, writing the
+// pre-activation Z (kept for backprop) and the post-activation Aout. This avoids
+// writing Z to global memory and reading it back twice (once to add bias, once to
+// activate) and turns 3 kernel launches into 1.
+//
+// WHY FUSION HELPS: these element-wise epilogue steps are memory-bound — they do
+// almost no arithmetic per element but each separate kernel must stream the whole
+// [M,N] tensor through global memory. Doing them in-register right after the
+// matmul removes those extra round-trips (and two launch + sync overheads).
+//
+// act_type selects the activation (the 0..2 values match mlp.cuh's Activation):
+//     0 = ReLU      1 = LeakyReLU (negative slope `alpha`)
+//     2 = Tanh      3 = Identity  (used by the OUTPUT layer; softmax_rows is then
+//                                  applied to Z separately, as softmax is row-wise
+//                                  and cannot be fused element-by-element)
+//
+// Shapes (row-major, NO transpose — the forward linear step never needs one):
+//   Ain  : [M,K]  previous activations (M = batch, K = in_features)
+//   W    : [K,N]  weights              (K = in_features, N = out_features)
+//   bias : [N]    per-output bias
+//   Z    : [M,N]  output pre-activation  (written for the backward pass)
+//   Aout : [M,N]  output post-activation = act(Z)
+//
+// Launch config (set by launch_gemm_bias_act): block = kTileDim×kTileDim, grid
+// covers [M,N] — identical to gemm_tiled; only the per-thread epilogue differs.
+// ============================================================================
+__global__ void gemm_bias_act(const float* Ain, const float* W, const float* bias,
+                              float* Z, float* Aout,
+                              int M, int N, int K, int act_type, float alpha);
+
+// Host wrapper: 2-D tiled launch covering [M,N], then CUDA_CHECK_LAST().
+void launch_gemm_bias_act(const float* Ain, const float* W, const float* bias,
+                          float* Z, float* Aout,
+                          int M, int N, int K, int act_type, float alpha);
