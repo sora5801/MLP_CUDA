@@ -82,6 +82,8 @@ MLP_CUDA/
 ├── .gitignore                  Ignores build artifacts and editor/OS cruft.
 ├── Makefile                    nvcc build for Linux/WSL (all / run / clean).
 ├── CMakeLists.txt              Cross-platform build (Windows MSVC+CUDA, Linux).
+├── MLP_CUDA.sln                Visual Studio 2026 solution (0004).
+├── MLP_CUDA.vcxproj            VS CUDA project — builds demo/demo.cu (0004).
 ├── include/
 │   ├── common.cuh              Error macros (CUDA_CHECK), constants, ceil_div.
 │   ├── matrix.cuh              Matrix struct + device-memory helper decls.
@@ -96,6 +98,8 @@ MLP_CUDA/
 │   ├── dataset.cu              make_blobs, standardize, shuffle, split (host-side).
 │   ├── optim.cu                (0002) Momentum & Adam kernels + optim_create/step.
 │   └── main.cu                 Entry point: data → build → train → validate.
+├── demo/
+│   └── demo.cu                 (0004) Guided feature showcase; the VS entry point.
 └── docs/
     ├── math_derivation.md      Full forward/backward derivation, eq → kernel.
     ├── cuda_concepts.md        Every CUDA concept used here, tied to kernels.
@@ -103,7 +107,8 @@ MLP_CUDA/
         ├── README.md           The per-push changelog convention.
         ├── 0001-initial-implementation.md            The first push.
         ├── 0002-optimizers-activations-reduction.md  Optimizers/activations/reduction.
-        └── 0003-on-device-rng-and-dropout.md         RNG + dropout (this push).
+        ├── 0003-on-device-rng-and-dropout.md         RNG + dropout.
+        └── 0004-visual-studio-solution-and-demo.md   VS solution + demo (this push).
 ```
 
 ---
@@ -227,6 +232,24 @@ cmake --build build --config Release
 #   Linux:   ./build/mlp
 #   Windows: build\Release\mlp.exe
 ```
+
+### Option C — Visual Studio 2026 (push 0004)
+
+Open **`MLP_CUDA.sln`**, choose **Release / x64**, and press **Ctrl+F5**. This
+builds **`demo/demo.cu`** — a guided showcase that runs *everything* (GEMM tiling,
+RNG self-test, gradient check, and optimizer/activation/dropout comparison tables).
+
+- Requires the **NVIDIA CUDA Toolkit 13.x** (installs the VS build integration and
+  sets `CUDA_PATH`) and an NVIDIA GPU.
+- The project targets **`sm_75`** (Turing). For another GPU, change *Code
+  Generation* in the `.vcxproj` (or Project ▸ Properties ▸ CUDA C/C++ ▸ Device) to
+  e.g. `compute_86,sm_86` (Ampere) / `compute_89,sm_89` (Ada).
+- A different CUDA version? Update the two `CUDA 13.3.props/.targets` import paths
+  in the `.vcxproj` to match.
+- `src/main.cu` and `demo/demo.cu` each have their own `main()`; the VS project
+  compiles the **demo** (plus the library) while Make/CMake compile **main.cu** —
+  so the two entry points never clash. See
+  [`docs/changelog/0004-...md`](docs/changelog/0004-visual-studio-solution-and-demo.md).
 
 ### Configuring the demo (push 0002)
 

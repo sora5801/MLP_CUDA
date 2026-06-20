@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{a1111111-1111-1111-1111-111111111111}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Library Sources">
+      <UniqueIdentifier>{b2222222-2222-2222-2222-222222222222}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Demo">
+      <UniqueIdentifier>{c3333333-3333-3333-3333-333333333333}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\common.cuh"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="include\matrix.cuh"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="include\kernels.cuh"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="include\mlp.cuh"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="include\dataset.cuh"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="include\optim.cuh"><Filter>Header Files</Filter></ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <CudaCompile Include="src\matrix.cu"><Filter>Library Sources</Filter></CudaCompile>
+    <CudaCompile Include="src\kernels.cu"><Filter>Library Sources</Filter></CudaCompile>
+    <CudaCompile Include="src\mlp.cu"><Filter>Library Sources</Filter></CudaCompile>
+    <CudaCompile Include="src\dataset.cu"><Filter>Library Sources</Filter></CudaCompile>
+    <CudaCompile Include="src\optim.cu"><Filter>Library Sources</Filter></CudaCompile>
+    <CudaCompile Include="demo\demo.cu"><Filter>Demo</Filter></CudaCompile>
+  </ItemGroup>
+</Project>

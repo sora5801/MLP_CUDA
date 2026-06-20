@@ -57,3 +57,21 @@ Thumbs.db
 # Local assistant/agent scratch state (e.g. scheduled-task lock files). This is
 # per-machine harness state, not part of the project source.
 .claude/
+
+# --- Visual Studio / MSBuild ------------------------------------------------
+# Generated when you open/build MLP_CUDA.sln. The .sln/.vcxproj themselves ARE
+# committed (they're the project definition); everything below is build output or
+# per-user state that must not be.
+# Solution Explorer / IntelliSense cache and per-user window state.
+.vs/
+# Per-user project settings (window layout, local debugger args).
+*.user
+# Build output + intermediate dirs. OutDir is <repo>\x64\<Config>\ and the CUDA
+# build customization keeps its intermediates under <repo>\MLP_CUDA\x64\<Config>\;
+# a bare "x64/" (no leading slash) ignores both wherever they appear.
+x64/
+Win32/
+# Debug/PDB databases emitted by the MSVC/CUDA build.
+*.pdb
+*.idb
+*.ilk
