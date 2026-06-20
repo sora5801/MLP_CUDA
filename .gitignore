@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------------------
+# .gitignore for the MLP_CUDA study repository
+#
+# Purpose: keep the repository limited to *source* and *documentation* only.
+# Anything that can be regenerated from the source (compiled objects, the final
+# executable, the build/ scratch directory) or that is specific to one
+# developer's machine (editor settings, OS metadata files) should never be
+# committed. This keeps clones small, avoids noisy diffs, and prevents binaries
+# built for one GPU/OS from leaking into another contributor's checkout.
+#
+# Pattern syntax reminders (so a learner can edit this confidently):
+#   - A trailing "/" matches a directory only (e.g. "build/").
+#   - "*" matches any run of characters within a single path segment.
+#   - A leading "/" anchors a pattern to the repo root; without it, the pattern
+#     matches in every directory.
+#   - Lines starting with "#" are comments; blank lines are ignored.
+# ---------------------------------------------------------------------------
+
+# --- Build output -----------------------------------------------------------
+# The Makefile compiles each src/*.cu into build/*.o and links build/mlp here,
+# and CMake also drops its generated files under build/. The whole directory is
+# disposable: `make clean` / a fresh CMake configure recreates it from scratch.
+build/
+
+# Object files emitted by nvcc/the host compiler before linking. Ignored
+# anywhere (no leading "/") in case someone compiles outside build/.
+*.o
+*.obj
+
+# Linked executables.
+#   - "mlp"   : the Linux/WSL Makefile target name (no extension on POSIX).
+#   - "*.exe" : the Windows executable produced by the MSVC + CUDA / CMake build.
+mlp
+*.exe
+
+# --- Editor / IDE cruft -----------------------------------------------------
+# Per-developer editor configuration that must not be shared across the team.
+# NOTE on syntax: in .gitignore a '#' only starts a comment when it is the FIRST
+# character of a line. A '#' placed AFTER a pattern is treated as part of the
+# pattern, not a comment, so each explanation must live on its own line above
+# the rule it documents (an inline "build/ # ..." would silently fail to match).
+# VS Code workspace settings, launch configs, etc.
+.vscode/
+# JetBrains (CLion) project metadata.
+.idea/
+# Vim swap files left behind by an open editor session.
+*.swp
+
+# --- OS metadata ------------------------------------------------------------
+# Files the operating system sprinkles into directories; never source-relevant.
+# macOS Finder folder metadata.
+.DS_Store
+# Windows Explorer thumbnail cache.
+Thumbs.db
+
+# --- Tooling state ----------------------------------------------------------
+# Local assistant/agent scratch state (e.g. scheduled-task lock files). This is
+# per-machine harness state, not part of the project source.
+.claude/
