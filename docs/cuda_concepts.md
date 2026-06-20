@@ -22,6 +22,7 @@ open beside `src/kernels.cu`.
 7. [Shared memory & tiling (`gemm_tiled`)](#7-shared-memory--tiling-gemm_tiled)
 7b. [Parallel reduction (`reduce_sum`) — push 0002](#7b-parallel-reduction-reduce_sum--push-0002)
 7c. [On-device RNG (`rng_uniform`, dropout) — push 0003](#7c-on-device-rng-rng_uniform-dropout--push-0003)
+7d. [CUDA streams & double-buffering — push 0005](#7d-cuda-streams--double-buffering--push-0005)
 8. [Thread divergence (ReLU & guards)](#8-thread-divergence-relu--guards)
 9. [Numerical stability (softmax max-subtraction)](#9-numerical-stability-softmax-max-subtraction)
 10. [Synchronization (`__syncthreads`, `cudaDeviceSynchronize`)](#10-synchronization-__syncthreads-cudadevicesynchronize)
@@ -490,6 +491,69 @@ dropout is *inverted* (survivors pre-scaled), no other change is needed at test 
 
 ---
 
+## 7d. CUDA streams & double-buffering — push 0005
+
+So far every kernel ran on the **default stream** and our `launch_*` wrappers
+`cudaDeviceSynchronize()` after each one — simple and great for catching errors, but
+it means the GPU does one thing at a time: copy a batch in, compute it, copy the
+next, compute it… The copy engine sits idle during compute and the compute engine
+sits idle during the copy. **Streams** let independent work run *concurrently* so
+those two phases overlap. `src/stream_demo.cu` is a standalone benchmark of this.
+
+### Four ingredients
+
+1. **Pinned (page-locked) host memory** — `cudaMallocHost`. The GPU's copy engine
+   DMAs directly to/from page-locked RAM. Ordinary pageable memory can be moved by
+   the OS, so the driver first stages it through a hidden pinned buffer, which makes
+   a `cudaMemcpyAsync` from pageable behave essentially *synchronously*. **Pinned
+   memory is the prerequisite for a copy that truly overlaps compute.**
+2. **Streams** — `cudaStreamCreate`. A stream is an ordered queue of GPU work.
+   Same stream ⇒ strictly ordered; **different streams ⇒ may run concurrently**.
+   Modern GPUs have separate copy and compute engines, so a copy on stream B can run
+   while a kernel on stream A executes.
+3. **Async copies** — `cudaMemcpyAsync(dst, src, bytes, kind, stream)`. Non-blocking;
+   returns immediately and runs on the given stream's timeline.
+4. **Double-buffering** — two device input buffers and two stream "lanes". While
+   lane A computes on buffer A, lane B copies the next batch into buffer B:
+
+   ```
+   for i in 0..N-1:
+       lane = i & 1                                   // alternate 0,1,0,1,...
+       cudaMemcpyAsync(d_in[lane], host_i, bytes, H2D, stream[lane])
+       compute<<<grid, block, 0, stream[lane]>>>(d_in[lane], d_out_i, ...)
+   cudaDeviceSynchronize()                             // wait for all lanes at the end
+   ```
+
+### Why no events are needed for buffer safety
+
+Even batches use lane 0 (buffer 0, stream 0); odd batches use lane 1. Within a lane,
+`copy_i → compute_i → the next copy that reuses that buffer` are all in the **same
+stream**, so they're ordered automatically — a buffer is never overwritten while a
+prior compute is still reading it. Across lanes the buffers differ, so there's no
+conflict. **The rotation itself is the synchronization.** (When lanes must hand off
+data you'd use `cudaEvent` + `cudaStreamWaitEvent`; here we don't need to.)
+
+### Timing a multi-stream pipeline
+
+`cudaEvent` timestamps live on **one** stream's timeline, so a `stop` event on the
+default stream fires as soon as it's reached there — it does *not* wait for work
+queued on other streams. The simple correct way to time a pipeline is host
+wall-clock (`std::chrono`) around the issue loop plus a final
+`cudaDeviceSynchronize()`. The demo does this and verifies the pipelined result
+checksum equals the serial one — proving the overlap didn't corrupt anything.
+
+### What the benchmark shows
+
+Serial (sync, no overlap) is slowest; the double-buffered pipeline from **pinned**
+memory is fastest (~1.3–1.6× on the RTX 2080 SUPER for balanced copy/compute sizes);
+the **pageable** pipeline lands in between, because its async copies still stage
+through the driver and overlap less. The speedup is bounded by how well copy and
+compute balance: if compute dominates, the copy hides "for free" and the win shrinks
+toward 1×. This is exactly the pattern a real trainer uses to prefetch the next
+mini-batch while the GPU trains on the current one.
+
+---
+
 ## 8. Thread divergence (ReLU & guards)
 
 All 32 threads in a warp share one instruction pointer (SIMT execution). When a
@@ -704,6 +768,7 @@ orchestrated by `src/mlp.cu` per the algorithms in `include/mlp.cuh`):
 | `momentum_update` / `adam_update` (0002) | 1-D grid over params | optimizer state in device buffers |
 | `fill_uniform` (0003) | 1-D grid over elements | counter-based RNG (§7c), `random=hash(seed,i)` |
 | `dropout_forward` / `dropout_backward` (0003) | 1-D grid over elements | RNG-driven mask (§7c), train/inference mode |
+| `pipeline_compute` (0005) | 1-D grid, launched on a stream | streams + double-buffering (§7d); no per-launch sync |
 
 A single training step (see `src/main.cu`) exercises nearly all of it:
 

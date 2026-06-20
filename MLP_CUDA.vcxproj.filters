@@ -18,6 +18,7 @@
     <ClInclude Include="include\mlp.cuh"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="include\dataset.cuh"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="include\optim.cuh"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="include\stream_demo.cuh"><Filter>Header Files</Filter></ClInclude>
   </ItemGroup>
   <ItemGroup>
     <CudaCompile Include="src\matrix.cu"><Filter>Library Sources</Filter></CudaCompile>
@@ -25,6 +26,7 @@
     <CudaCompile Include="src\mlp.cu"><Filter>Library Sources</Filter></CudaCompile>
     <CudaCompile Include="src\dataset.cu"><Filter>Library Sources</Filter></CudaCompile>
     <CudaCompile Include="src\optim.cu"><Filter>Library Sources</Filter></CudaCompile>
+    <CudaCompile Include="src\stream_demo.cu"><Filter>Library Sources</Filter></CudaCompile>
     <CudaCompile Include="demo\demo.cu"><Filter>Demo</Filter></CudaCompile>
   </ItemGroup>
 </Project>

@@ -133,6 +133,7 @@
     <ClInclude Include="include\mlp.cuh" />
     <ClInclude Include="include\dataset.cuh" />
     <ClInclude Include="include\optim.cuh" />
+    <ClInclude Include="include\stream_demo.cuh" />
   </ItemGroup>
 
   <!-- CUDA sources: the library .cu files + the demo entry point.
@@ -143,6 +144,7 @@
     <CudaCompile Include="src\mlp.cu" />
     <CudaCompile Include="src\dataset.cu" />
     <CudaCompile Include="src\optim.cu" />
+    <CudaCompile Include="src\stream_demo.cu" />
     <CudaCompile Include="demo\demo.cu" />
   </ItemGroup>
 

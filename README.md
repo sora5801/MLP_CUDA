@@ -70,6 +70,9 @@ Repeat over many batches/epochs and the loss falls / accuracy rises.
 - **(push 0003) Dropout + train/inference modes** — inverted dropout built on that
   RNG, plus the train/eval switch it forces; and why a *reproducible* mask is what
   lets you gradient-check a stochastic layer.
+- **(push 0005) CUDA streams & double-buffering** — overlap host→device copies with
+  compute using pinned memory + two streams; a benchmark (serial vs pipelined,
+  pinned vs pageable) with verified-identical results.
 
 ---
 
@@ -90,13 +93,15 @@ MLP_CUDA/
 │   ├── kernels.cuh             All __global__ kernels + launch_* wrapper decls.
 │   ├── mlp.cuh                 Layer / MLP structs + the training-API decls.
 │   ├── dataset.cuh             Synthetic "blobs" dataset decls.
-│   └── optim.cuh               (0002) SGD / Momentum / Adam optimizer API.
+│   ├── optim.cuh               (0002) SGD / Momentum / Adam optimizer API.
+│   └── stream_demo.cuh         (0005) streams + double-buffering benchmark decl.
 ├── src/
 │   ├── matrix.cu               Matrix helpers: alloc/free/zero/copy/bytes.
 │   ├── kernels.cu              ALL CUDA kernels + launchers — the heart of it.
 │   ├── mlp.cu                  forward / backward / loss / grad-check / evaluate.
 │   ├── dataset.cu              make_blobs, standardize, shuffle, split (host-side).
 │   ├── optim.cu                (0002) Momentum & Adam kernels + optim_create/step.
+│   ├── stream_demo.cu          (0005) streams + double-buffering benchmark impl.
 │   └── main.cu                 Entry point: data → build → train → validate.
 ├── demo/
 │   └── demo.cu                 (0004) Guided feature showcase; the VS entry point.
@@ -108,7 +113,8 @@ MLP_CUDA/
         ├── 0001-initial-implementation.md            The first push.
         ├── 0002-optimizers-activations-reduction.md  Optimizers/activations/reduction.
         ├── 0003-on-device-rng-and-dropout.md         RNG + dropout.
-        └── 0004-visual-studio-solution-and-demo.md   VS solution + demo (this push).
+        ├── 0004-visual-studio-solution-and-demo.md   VS solution + demo.
+        └── 0005-cuda-streams-double-buffering.md     Streams + double-buffering (this push).
 ```
 
 ---

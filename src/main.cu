@@ -34,6 +34,7 @@
 #include "mlp.cuh"     // MLP struct + create/forward/backward/step/loss/acc/gradcheck/evaluate
 #include "dataset.cuh" // make_blobs / standardize / shuffle / split / free
 #include "optim.cuh"   // (push 0002) Optimizer: SGD / Momentum / Adam
+#include "stream_demo.cuh" // (push 0005) CUDA streams + double-buffering benchmark
 
 // -----------------------------------------------------------------------------
 // CONFIGURATION CONSTANTS (spec §2 src/main.cu, item 1)
@@ -303,6 +304,9 @@ int main() {
     // (push 0003) RNG self-test: verify the on-device counter-based RNG (mean≈0.5)
     // — the same generator that powers dropout below. Reuses the 0002 reduction.
     run_rng_selftest();
+
+    // (push 0005) CUDA streams + double-buffering: overlap H2D copies with compute.
+    run_stream_pipeline_demo();
 
     // -------------------------------------------------------------------------
     // STEP 2: build the synthetic dataset on the HOST, then standardize it.

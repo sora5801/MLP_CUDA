@@ -39,6 +39,7 @@
 #include "mlp.cuh"      // MLP API (create/forward/backward/evaluate/grad-check)
 #include "dataset.cuh"  // make_blobs / standardize / shuffle / split
 #include "optim.cuh"    // SGD / Momentum / Adam
+#include "stream_demo.cuh" // (push 0005) CUDA streams + double-buffering benchmark
 
 // ---- Shared experiment configuration ---------------------------------------
 static constexpr unsigned long long kSeed   = 1234567ULL; // master RNG seed
@@ -230,6 +231,11 @@ int main() {
     show_device();
     gemm_benchmark();
     rng_selftest();
+
+    // ---- 3b (push 0005): CUDA streams + double-buffering ----
+    // Overlap host->device batch copies with compute, comparing a serial pipeline
+    // to a double-buffered one (pinned vs pageable host memory).
+    run_stream_pipeline_demo();
 
     // ---- Build the dataset once: blobs -> standardize -> shuffle -> split ----
     Dataset data = make_blobs(kNPerClass, kNFeatures, kNClasses, kClusterStd, kSeed);
