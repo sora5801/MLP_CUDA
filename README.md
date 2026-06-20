@@ -56,6 +56,14 @@ Repeat over many batches/epochs and the loss falls / accuracy rises.
   `cudaGetLastError`) via the `CUDA_CHECK` / `CUDA_CHECK_LAST` macros.
 - **Proving correctness without a reference framework** using a central
   finite-difference gradient check.
+- **(push 0002) Parallel reduction** — the tree-reduction pattern (`reduce_sum`),
+  used to compute loss & accuracy on the GPU instead of copying arrays back.
+- **(push 0002) Stateful optimizers** — SGD, Momentum, and Adam behind one
+  `Optimizer` API, showing per-parameter device **state** and bias correction.
+- **(push 0002) Pluggable activations** — ReLU / LeakyReLU / Tanh, including why
+  Tanh's backward needs the *post*-activation while ReLU's needs the *pre*-one.
+- **(push 0002) Train/validation split + inference-only evaluation** to measure
+  generalization on held-out data.
 
 ---
 
@@ -73,19 +81,22 @@ MLP_CUDA/
 │   ├── matrix.cuh              Matrix struct + device-memory helper decls.
 │   ├── kernels.cuh             All __global__ kernels + launch_* wrapper decls.
 │   ├── mlp.cuh                 Layer / MLP structs + the training-API decls.
-│   └── dataset.cuh             Synthetic "blobs" dataset decls.
+│   ├── dataset.cuh             Synthetic "blobs" dataset decls.
+│   └── optim.cuh               (0002) SGD / Momentum / Adam optimizer API.
 ├── src/
 │   ├── matrix.cu               Matrix helpers: alloc/free/zero/copy/bytes.
 │   ├── kernels.cu              ALL CUDA kernels + launchers — the heart of it.
-│   ├── mlp.cu                  forward / backward / sgd / loss / grad-check.
-│   ├── dataset.cu              make_blobs, standardize, shuffle (all host-side).
-│   └── main.cu                 Entry point: data → build → train → eval.
+│   ├── mlp.cu                  forward / backward / loss / grad-check / evaluate.
+│   ├── dataset.cu              make_blobs, standardize, shuffle, split (host-side).
+│   ├── optim.cu                (0002) Momentum & Adam kernels + optim_create/step.
+│   └── main.cu                 Entry point: data → build → train → validate.
 └── docs/
     ├── math_derivation.md      Full forward/backward derivation, eq → kernel.
     ├── cuda_concepts.md        Every CUDA concept used here, tied to kernels.
     └── changelog/
         ├── README.md           The per-push changelog convention.
-        └── 0001-initial-implementation.md   What this first push added.
+        ├── 0001-initial-implementation.md            The first push.
+        └── 0002-optimizers-activations-reduction.md  This push.
 ```
 
 ---
@@ -171,6 +182,12 @@ A quick index; each is explained concretely (with the kernel that uses it) in
 > `nvcc`, the CUDA runtime headers, and `cuda_runtime.h`), plus an NVIDIA GPU
 > with a working driver. This repo uses **only** the CUDA runtime API and the C++
 > standard library — no cuBLAS / cuRAND / Thrust.
+>
+> **Verified build:** RTX 2080 SUPER (compute capability **sm_75**), **CUDA 13.3**,
+> MSVC (Visual Studio) on Windows, C++14. The gradient check passes (~1e-5) and
+> training reaches 100% accuracy. On **CUDA ≥ 13** note that `cudaDeviceProp::clockRate`
+> was removed; this repo reads the core clock via `cudaDeviceGetAttribute(cudaDevAttrClockRate)`
+> (see `print_device_props` in `src/main.cu`).
 
 ### Option A — Makefile (Linux / WSL)
 
@@ -204,6 +221,21 @@ cmake --build build --config Release
 #   Windows: build\Release\mlp.exe
 ```
 
+### Configuring the demo (push 0002)
+
+All experiment knobs are compile-time constants at the top of `src/main.cu`.
+Edit and rebuild to study different setups — the **gradient check validates
+whichever you choose**:
+
+| Constant / call | Options |
+|-----------------|---------|
+| `kHiddenAct` | `Activation::ReLU` (default) · `Activation::LeakyReLU` · `Activation::Tanh` |
+| `optim_create(net, …)` | `opt_adam(0.01f)` (default) · `opt_momentum(0.1f, 0.9f)` · `opt_sgd(0.1f)` |
+| `kValSamples` | size of the held-out validation split (default 192) |
+
+Note Adam's learning rate (~`0.01`) is intentionally smaller than SGD's (~`0.1`)
+because Adam normalizes each step by the gradient's running RMS.
+
 ---
 
 ## Expected output
@@ -229,17 +261,22 @@ When it runs you should see (numbers will vary slightly by GPU and seed, but the
    ...
    ```
 
-4. **Training** — the **loss decreasing** and **train accuracy rising** over the
-   epochs, e.g.:
+4. **Training** — the chosen optimizer's name, then the **loss decreasing** and
+   **train accuracy rising** over the epochs. With the default Adam optimizer on
+   this easy dataset it converges within a few epochs, e.g.:
 
    ```
-   epoch  1  loss=1.0421  acc=0.58
-   epoch 10  loss=0.4123  acc=0.91
+   ==================== TRAINING (Adam, lr=0.01) ==========
+   epoch  1/60  loss 0.3890  train_acc 0.873
+   epoch 10/60  loss 0.0001  train_acc 1.000
    ...
-   epoch 60  loss=0.0937  acc=0.99
+   epoch 60/60  loss 0.0000  train_acc 1.000
    ```
 
 5. **Throughput** — total training time and samples/second (CUDA-event timed).
+6. **(push 0002) Validation** — held-out loss/accuracy on the data the optimizer
+   never trained on, e.g. `held-out val: loss 0.0000  acc 1.000`. Close to the
+   train accuracy ⇒ the model generalized (this dataset is easily separable).
 
 ---
 

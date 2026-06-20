@@ -394,6 +394,33 @@ The output layer has no ReLU gate: its `dZ` comes directly from §3
 (`cross_entropy_grad`), so the softmax/CE pair never needs a separate softmax
 Jacobian kernel.
 
+### 4.5 Other activation derivatives — LeakyReLU, Tanh   [added in push 0002]
+
+The backward chain `dZ_prev = dA_prev ⊙ act'(Z_prev)` is identical for *any*
+elementwise activation; only `act'` changes. The repo implements three, selected
+per network by `Activation` (see `include/mlp.cuh`):
+
+| Activation | forward  `a = act(z)`     | derivative `act'(z)`        | backward reads | kernel                |
+| ---------- | ------------------------ | --------------------------- | -------------- | --------------------- |
+| ReLU       | `max(0, z)`              | `1 if z>0 else 0`           | **Z** (pre)    | `relu_backward`       |
+| LeakyReLU  | `z if z>0 else α·z`      | `1 if z>0 else α`           | **Z** (pre)    | `leaky_relu_backward` |
+| Tanh       | `tanh(z)`                | `1 − tanh(z)² = 1 − a²`     | **A** (post)   | `tanh_backward`       |
+
+Two things to internalize:
+
+- **ReLU vs LeakyReLU.** Plain ReLU has a *zero* gradient on the negative side, so
+  a unit stuck at `z ≤ 0` for every input receives `act'(z)=0` forever and can
+  never update — a "dead" unit. LeakyReLU keeps a small slope `α` (this repo uses
+  `α = 0.01`), so `act'(z)=α ≠ 0` on the negative side and the unit can recover.
+
+- **Tanh uses the OUTPUT, not the input.** Because `tanh'(z) = 1 − tanh(z)²`, the
+  cheapest correct form reuses the already-computed `a = tanh(z)`. So
+  `tanh_backward` consumes the cached *post*-activation `A`, while the ReLU family
+  consumes the *pre*-activation `Z`. `mlp_backward` dispatches to the right tensor
+  for each layer; passing the wrong one is a classic silent bug — and exactly the
+  kind of mistake the gradient check (§7) catches. This is *why* every `Layer`
+  caches both `Z` and `A`.
+
 --------------------------------------------------------------------------------
 ## 5. Backward driver (chaining layers)
 
@@ -445,6 +472,57 @@ minimal update, deliberately, so the gradient math above is the *only* thing tha
 determines learning behavior. `mlp_sgd_step` simply calls `launch_sgd_update`
 once per weight matrix and once per bias vector.
 
+### 6.1 Momentum (the "heavy ball")   [added in push 0002]
+
+Plain SGD reacts only to the *current* gradient, so it zig-zags across steep,
+narrow valleys and crawls along shallow ones. Momentum accumulates a **velocity**
+`v` — an exponentially-decayed running sum of gradients — and steps along that:
+
+```
+v_t   = μ · v_{t-1} + g_t                 # μ ∈ [0,1), e.g. 0.9; g_t = current grad
+θ_t   = θ_{t-1} − lr · v_t                # step along the accumulated velocity
+```
+
+Consistent gradient directions reinforce across steps (the ball "picks up speed");
+oscillating components partially cancel. With `v_0 = 0`, the first step equals
+`−lr·g_1` (plain SGD) and momentum builds from there. Implemented per element by
+**[`momentum_update`]** (`optim.cu`), which keeps `v` in a persistent device buffer
+the same shape as the parameter.
+
+### 6.2 Adam (adaptive moments)   [added in push 0002]
+
+Adam gives every parameter its **own** step size by tracking two running averages
+— the mean of the gradient (1st moment `m`) and the mean of its square (2nd moment
+`v`) — then dividing the step by the RMS of recent gradients:
+
+```
+m_t = β1·m_{t-1} + (1−β1)·g_t             # 1st moment (β1≈0.9)
+v_t = β2·v_{t-1} + (1−β2)·g_t²            # 2nd moment (β2≈0.999)
+
+m̂_t = m_t / (1 − β1ᵗ)                     # bias-corrected 1st moment
+v̂_t = v_t / (1 − β2ᵗ)                     # bias-corrected 2nd moment
+
+θ_t = θ_{t-1} − lr · m̂_t / (√v̂_t + ε)     # ε≈1e-8 guards the divide
+```
+
+Two ideas to take away:
+
+- **Bias correction.** `m` and `v` start at `0`, so for small `t` they are biased
+  toward `0` (too small). Dividing by `(1 − βᵗ)` — tiny early, → 1 as `t` grows —
+  rescales them into unbiased estimates, so the first few steps aren't artificially
+  shrunk. Our `optim_step` computes the two denominators once per step on the host
+  (the same scalars for every element) and passes them into **[`adam_update`]**, so
+  the kernel needs no `pow`/`t`.
+- **Per-parameter adaptivity.** Dividing by `√v̂` normalizes each parameter's step
+  by the typical size of its own recent gradients: large-gradient weights are
+  damped, small-gradient weights amplified. That is why one global `lr` works
+  across very differently-scaled parameters — and why Adam's good `lr` (~`1e-2`
+  here) is smaller than SGD's (~`1e-1`). State `m` and `v` live in per-parameter
+  device buffers allocated by `optim_create`.
+
+All three optimizers share the SGD-derived fact that the gradients already carry
+the `1/B` batch-mean (§3), so none of them re-introduces a `1/B` factor.
+
 --------------------------------------------------------------------------------
 ## 7. Why the gradient check works (finite differences)
 
@@ -480,7 +558,16 @@ produced by the kernels must match calculus, and the grad-check proves they do.
 | Bwd  | `dA_prev = dZ · Wᵀ`                                    | `gemm_naive` (`transB=true`)         | §4.3   |
 | Bwd  | `dZ_prev = dA_prev ⊙ relu'(Z_prev)`                  | `relu_backward`                      | §4.4   |
 | Upd  | `param -= lr * grad`                                   | `sgd_update`                         | §6     |
+| Fwd  | `a = z if z>0 else αz` (LeakyReLU)                     | `leaky_relu_forward`                 | §4.5   |
+| Bwd  | `dZ = dA ⊙ (z>0 ? 1 : α)`                              | `leaky_relu_backward`                | §4.5   |
+| Fwd  | `a = tanh(z)`                                          | `tanh_forward`                       | §4.5   |
+| Bwd  | `dZ = dA ⊙ (1 − a²)`  (uses post-act A)               | `tanh_backward`                      | §4.5   |
+| Upd  | `v = μv + g ; θ -= lr·v`  (Momentum)                  | `momentum_update`                    | §6.1   |
+| Upd  | Adam moment/bias-corrected step                       | `adam_update`                        | §6.2   |
+| Misc | `Σ` over an array (loss/accuracy on GPU)             | `reduce_sum_kernel`                  | —      |
+| Misc | per-row `argmax == label`                             | `predictions_correct`                | —      |
 
 Read this table top-to-bottom for a forward pass, then bottom region (Bwd) from
 `cross_entropy_grad` upward for a backward pass — that ordering mirrors the
-driver loops in `src/mlp.cu`.
+driver loops in `src/mlp.cu`. (The §4.5/§6.1/§6.2 rows and the two Misc kernels
+were added in push 0002.)

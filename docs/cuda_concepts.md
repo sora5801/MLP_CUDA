@@ -20,6 +20,7 @@ open beside `src/kernels.cu`.
 5. [2-D grids for GEMM](#5-2-d-grids-for-gemm)
 6. [Memory coalescing](#6-memory-coalescing)
 7. [Shared memory & tiling (`gemm_tiled`)](#7-shared-memory--tiling-gemm_tiled)
+7b. [Parallel reduction (`reduce_sum`) — push 0002](#7b-parallel-reduction-reduce_sum--push-0002)
 8. [Thread divergence (ReLU & guards)](#8-thread-divergence-relu--guards)
 9. [Numerical stability (softmax max-subtraction)](#9-numerical-stability-softmax-max-subtraction)
 10. [Synchronization (`__syncthreads`, `cudaDeviceSynchronize`)](#10-synchronization-__syncthreads-cudadevicesynchronize)
@@ -357,6 +358,80 @@ code.)
 
 ---
 
+## 7b. Parallel reduction (`reduce_sum`) — push 0002
+
+After the element-wise map and the GEMM, **reduction** is the third foundational
+GPU pattern: collapse an array of `n` values into one (a sum, max, etc.). It looks
+inherently serial — each add seems to depend on the previous running total — but a
+**tree** turns it into `log2(n)` parallel steps. Push 0001 sidestepped this by
+copying the per-row loss vector to the host and summing in a C++ loop; push 0002
+does it on the GPU and reads back a single float, which is what `reduce_sum_kernel`
++ `launch_reduce_sum` (in `src/kernels.cu`) implement.
+
+### The in-block tree
+
+A block of `B` threads reduces the slice of the array it owns down to one partial
+sum, held in `__shared__` memory:
+
+```c++
+__global__ void reduce_sum_kernel(const float* in, float* out, int n) {
+    extern __shared__ float sdata[];           // B floats (size = 3rd launch arg)
+    int tid = threadIdx.x;
+    // Each thread adds TWO global elements at load time ("first add during load"):
+    // this collapses the first tree level for free and halves global reads.
+    int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
+    float v = 0.0f;
+    if (i < n)              v  = in[i];
+    if (i + blockDim.x < n) v += in[i + blockDim.x];
+    sdata[tid] = v;
+    __syncthreads();                            // whole tile loaded before reducing
+
+    // Fold the upper half into the lower half, halving the width each step.
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();                        // level complete before the next
+    }
+    if (tid == 0) out[blockIdx.x] = sdata[0];   // block's total
+}
+```
+
+Things worth pausing on:
+
+- **Why shared memory.** The running partials are read and written `log2(B)` times.
+  Keeping them on-chip (shared memory ≈ 100× faster than global) instead of in
+  global memory is what makes the reduction fast — the same bandwidth-tier argument
+  as tiling (§7).
+- **Why `__syncthreads()` every step.** Level `k+1` reads slots that level `k`
+  wrote. Without a barrier between them, a fast thread could read a neighbor's slot
+  before it was updated — a read-before-write race. And the barrier must be hit by
+  *all* threads, so the loop body is uniform (the `if (tid < s)` just makes some
+  threads write a no-op-free value; every thread still reaches the `__syncthreads`).
+- **Power-of-two block size.** Halving `s = B/2, B/4, … 1` only tiles the block
+  exactly when `B` is a power of two — `kBlockSize = 256` (= 2⁸) qualifies.
+
+### Why multiple passes (`launch_reduce_sum`)
+
+A single kernel **cannot** sum across blocks: different blocks share neither memory
+nor a barrier, and their scheduling order is undefined. So full reduction is
+iterative — each pass turns `n` values into `#blocks` partials:
+
+```
+pass 1:  n        elements  ->  ceil(n / 2B)        partials  (in buf_a)
+pass 2:  that many          ->  fewer                          (in buf_b)
+...      ...                ->  1                               (final scalar)
+```
+
+`launch_reduce_sum` "ping-pongs" two scratch buffers (read one, write the other)
+until a single value remains, then copies that one float to the host. The MLP uses
+it twice: `mlp_compute_loss` sums the per-row losses, and `mlp_accuracy_device`
+sums the per-row `predictions_correct` flags — both metrics computed entirely on
+the GPU. (Optimization left as an exercise: the *last warp* of each block executes
+in lock-step, so its final `log2(32)=5` steps can drop the `__syncthreads` and use
+`__shfl_down_sync` warp shuffles; and the two `cudaMalloc`s per call could be a
+single preallocated scratch reused across calls.)
+
+---
+
 ## 8. Thread divergence (ReLU & guards)
 
 All 32 threads in a warp share one instruction pointer (SIMT execution). When a
@@ -564,6 +639,11 @@ orchestrated by `src/mlp.cu` per the algorithms in `include/mlp.cuh`):
 | `cross_entropy_loss` | 1-D grid, 1 thr/row     | `log(0)` clamp (§9), D2H reduce on host (§2)  |
 | `bias_grad`          | 1-D grid, 1 thr/column  | column reduction, small-axis-per-thread       |
 | `sgd_update`         | 1-D grid over elements  | element-wise idiom (§4)                       |
+| `leaky_relu_*` (0002)| 1-D grid over elements  | element-wise idiom (§4), divergence (§8)      |
+| `tanh_*` (0002)      | 1-D grid over elements  | element-wise idiom (§4); backward uses post-act|
+| `reduce_sum_kernel` (0002) | multi-pass tree  | parallel reduction (§7b), shared mem + `__syncthreads` |
+| `predictions_correct` (0002) | 1-D grid, 1 thr/row | per-row argmax for device-side accuracy   |
+| `momentum_update` / `adam_update` (0002) | 1-D grid over params | optimizer state in device buffers |
 
 A single training step (see `src/main.cu`) exercises nearly all of it:
 

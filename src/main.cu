@@ -31,8 +31,9 @@
 #include "common.cuh"  // CUDA_CHECK / CUDA_CHECK_LAST, kBlockSize, kTileDim, ceil_div
 #include "matrix.cuh"  // Matrix struct + device-memory helpers
 #include "kernels.cuh" // launch_gemm / launch_gemm_tiled (used by the benchmark)
-#include "mlp.cuh"     // MLP struct + create/forward/backward/step/loss/acc/gradcheck
-#include "dataset.cuh" // make_blobs / dataset_standardize / dataset_shuffle / dataset_free
+#include "mlp.cuh"     // MLP struct + create/forward/backward/step/loss/acc/gradcheck/evaluate
+#include "dataset.cuh" // make_blobs / standardize / shuffle / split / free
+#include "optim.cuh"   // (push 0002) Optimizer: SGD / Momentum / Adam
 
 // -----------------------------------------------------------------------------
 // CONFIGURATION CONSTANTS (spec §2 src/main.cu, item 1)
@@ -54,10 +55,30 @@ static constexpr int   kNClasses    = 3;     // 3 Gaussian blobs / 3 logits out
 static constexpr int   kHidden0     = 64;    // first hidden layer width
 static constexpr int   kHidden1     = 32;    // second hidden layer width
 static constexpr int   kBatchSize   = 64;    // rows per forward/backward pass
-static constexpr int   kEpochs      = 60;    // full passes over the dataset
-static constexpr float kLearningRate= 0.10f; // SGD step size: param -= lr * grad
+static constexpr int   kEpochs      = 60;    // full passes over the TRAIN set
 static constexpr float kClusterStd  = 0.60f; // blob spread; smaller => separable
 static constexpr int   kReportEvery = 10;    // print metrics every N epochs
+
+// (push 0002) Train / validation split. Of the 768 total samples we hold out the
+// last `kValSamples` as a validation set the optimizer never trains on, so we can
+// measure generalization. Both counts are multiples of kBatchSize so neither split
+// drops a batch: 576 train = 9 batches, 192 val = 3 batches.
+static constexpr int   kValSamples  = 192;   // 3 validation batches
+static constexpr int   kTrainSamples= kNPerClass * kNClasses - kValSamples; // 576
+
+// (push 0002) Hidden-layer activation for the demo network. Switch to
+// Activation::LeakyReLU or Activation::Tanh to study how the choice (and its
+// backward kernel) affects training; the gradient check validates whichever you
+// pick. The output layer is always softmax.
+static constexpr Activation kHiddenAct = Activation::ReLU;
+
+// (push 0002) Optimizer + learning rate for training. Try:
+//   opt_sgd(0.10f)            — plain SGD (the push-0001 behavior)
+//   opt_momentum(0.10f, 0.9f) — SGD with heavy-ball momentum
+//   opt_adam(0.01f)           — adaptive per-parameter steps (default below)
+// Adam's good default lr (~1e-2 here) is much smaller than SGD's because Adam
+// normalizes each step by the gradient's running RMS.
+static constexpr float kLearningRate = 0.01f; // step size handed to the optimizer
 
 // Microbenchmark problem size: square M=N=K so the comparison is symmetric and
 // the arithmetic intensity is high enough that tiling can win. 512^3 multiply.
@@ -102,7 +123,18 @@ static void print_device_props() {
     printf("  Multiprocessors (SMs)   : %d\n", prop.multiProcessorCount);
     printf("  Max threads / block     : %d\n", prop.maxThreadsPerBlock);
     printf("  Warp size               : %d\n", prop.warpSize);
-    printf("  Clock rate              : %.0f MHz\n", prop.clockRate / 1000.0);
+    // Core clock rate.
+    // NOTE (CUDA 13+): the `clockRate` field was REMOVED from cudaDeviceProp in
+    // CUDA 13 (it had been deprecated for years). The portable replacement is the
+    // attribute-query API cudaDeviceGetAttribute(), which returns the same value
+    // in kHz via the enum cudaDevAttrClockRate. This is a concrete example of why
+    // we route every runtime call through CUDA_CHECK: the API surface shifts
+    // between toolkit versions, and querying an attribute is the version-stable
+    // way to read a device property. (On pre-13 toolkits you could instead read
+    // prop.clockRate directly.)
+    int clock_khz = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, device));
+    printf("  Core clock              : %.0f MHz\n", clock_khz / 1000.0);
     printf("====================================================\n\n");
 }
 
@@ -236,11 +268,20 @@ int main() {
     Dataset data = make_blobs(kNPerClass, kNFeatures, kNClasses,
                               kClusterStd, kSeed);
     dataset_standardize(data);
-    const int n_samples = data.n_samples;            // = kNPerClass * kNClasses
-    const int n_batches = n_samples / kBatchSize;    // full batches; remainder dropped
-    printf("Dataset: %d samples, %d features, %d classes -> %d full batches "
-           "of %d (last partial batch dropped)\n\n",
-           n_samples, data.n_features, data.n_classes, n_batches, kBatchSize);
+
+    // (push 0002) Shuffle ONCE so the upcoming split is class-balanced (make_blobs
+    // emits samples grouped by class), then hold out the last kValSamples rows as a
+    // validation set the optimizer never trains on. We train on `train` and measure
+    // generalization on `val` after training.
+    dataset_shuffle(data, kSeed);
+    Dataset train, val;
+    dataset_split(data, kTrainSamples, train, val);
+
+    const int n_batches = train.n_samples / kBatchSize;   // full TRAIN batches
+    printf("Dataset: %d samples (%d train / %d val), %d features, %d classes\n"
+           "  -> %d train batches of %d (val evaluated after training)\n\n",
+           data.n_samples, train.n_samples, val.n_samples,
+           data.n_features, data.n_classes, n_batches, kBatchSize);
 
     // -------------------------------------------------------------------------
     // STEP 3: define the layer widths and create the network.
@@ -248,10 +289,17 @@ int main() {
     //   (num_sizes - 1) = 3 layers; the last is the softmax output layer. Weights
     //   are He-initialized (N(0, sqrt(2/in))) for ReLU; biases start at 0. The
     //   per-layer Matrix caches (Z, A, dW, db, dZ, dA) are sized for kBatchSize.
+    //   (push 0002) Every hidden layer uses kHiddenAct (ReLU/LeakyReLU/Tanh).
     // -------------------------------------------------------------------------
     const int layer_sizes[] = { kNFeatures, kHidden0, kHidden1, kNClasses };
     const int num_sizes = static_cast<int>(sizeof(layer_sizes) / sizeof(int));
-    MLP net = mlp_create(layer_sizes, num_sizes, kBatchSize, kSeed);
+    MLP net = mlp_create(layer_sizes, num_sizes, kBatchSize, kSeed, kHiddenAct);
+
+    // (push 0002) Create the optimizer. It allocates whatever per-parameter STATE
+    // its rule needs (none for SGD; a velocity for Momentum; first/second moments
+    // for Adam), mirroring the network's weight/bias shapes. optim_step then
+    // replaces the push-0001 mlp_sgd_step in the training loop below.
+    Optimizer opt = optim_create(net, opt_adam(kLearningRate));
 
     // -------------------------------------------------------------------------
     // STEP 4: allocate ONE reusable device batch and label buffers.
@@ -274,23 +322,24 @@ int main() {
     std::vector<float> h_batch(static_cast<size_t>(kBatchSize) * kNFeatures);
 
     // -------------------------------------------------------------------------
-    // Helper lambda: load batch index `b` of the (already-shuffled) dataset into
+    // Helper lambda: load batch index `b` of the (already-shuffled) TRAIN set into
     // the host scratch buffers and copy them to the device buffers.
     //   - Copies kBatchSize rows starting at row b*kBatchSize.
-    //   - X rows are contiguous (n_features each) in data.X, so we can copy the
+    //   - X rows are contiguous (n_features each) in train.X, so we can copy the
     //     whole block; labels are copied element-wise into h_labels then H2D.
-    // This is the only data motion between CPU and GPU inside the loop.
+    // This is the only data motion between CPU and GPU inside the training loop.
+    // (Validation uses mlp_evaluate, which does its own batching/copies.)
     // -------------------------------------------------------------------------
     auto load_batch = [&](int b) {
         const int row0 = b * kBatchSize;                 // first sample of batch
-        const size_t feat_off = static_cast<size_t>(row0) * data.n_features;
-        const size_t feat_cnt = static_cast<size_t>(kBatchSize) * data.n_features;
+        const size_t feat_off = static_cast<size_t>(row0) * train.n_features;
+        const size_t feat_cnt = static_cast<size_t>(kBatchSize) * train.n_features;
         // Copy the contiguous [kBatchSize, n_features] block of inputs.
         for (size_t i = 0; i < feat_cnt; ++i)
-            h_batch[i] = data.X[feat_off + i];
+            h_batch[i] = train.X[feat_off + i];
         // Copy the matching labels.
         for (int r = 0; r < kBatchSize; ++r)
-            h_labels[r] = data.y[row0 + r];
+            h_labels[r] = train.y[row0 + r];
         // Push both to the GPU. matrix_copy_to_device wraps cudaMemcpy H2D.
         matrix_copy_to_device(d_batch, h_batch.data());
         CUDA_CHECK(cudaMemcpy(d_labels, h_labels.data(),
@@ -313,15 +362,17 @@ int main() {
 
     // -------------------------------------------------------------------------
     // STEP 8 + 10: the epoch training loop, timed end-to-end with cudaEvents.
-    //   Per epoch:  shuffle the dataset (so batches differ each epoch), then for
+    //   Per epoch:  shuffle the TRAIN set (so batches differ each epoch), then for
     //   each full batch:
     //       load_batch  -> H2D copy of inputs+labels
-    //       mlp_forward -> GEMM + bias + ReLU/softmax through all layers; the
+    //       mlp_forward -> GEMM + bias + activation/softmax through all layers; the
     //                      output layer's A now holds class probabilities
     //       loss/acc    -> read those probs for reporting (does not affect grads)
-    //       mlp_backward-> cross_entropy_grad seeds dZ, then GEMMs/ReLU' walk the
+    //       mlp_backward-> cross_entropy_grad seeds dZ, then GEMMs/act' walk the
     //                      chain backward filling every dW/db (already /batch)
-    //       mlp_sgd_step-> param -= lr*grad in place for every W and b
+    //       optim_step  -> (push 0002) the chosen optimizer updates every W and b
+    //                      using its gradients (and its persistent state, for
+    //                      Momentum/Adam). Replaces push-0001's mlp_sgd_step.
     //   We accumulate loss/acc across batches and print the epoch averages.
     // -------------------------------------------------------------------------
     cudaEvent_t train_start, train_stop;
@@ -329,12 +380,14 @@ int main() {
     CUDA_CHECK(cudaEventCreate(&train_stop));
     CUDA_CHECK(cudaEventRecord(train_start)); // mark start of all training
 
-    printf("==================== TRAINING =====================\n");
+    printf("==================== TRAINING (%s, lr=%.3g) ==========\n",
+           opt_name(opt.cfg.type), opt.cfg.lr);
     for (int epoch = 0; epoch < kEpochs; ++epoch) {
-        // Shuffle X rows and y together (Fisher-Yates) so each epoch sees data in
-        // a new order. We vary the seed by epoch to get a different but still
-        // fully deterministic permutation every epoch.
-        dataset_shuffle(data, kSeed + static_cast<unsigned long long>(epoch));
+        // Shuffle the TRAIN rows and labels together (Fisher-Yates) so each epoch
+        // sees data in a new order. We vary the seed by epoch to get a different
+        // but still fully deterministic permutation every epoch. The held-out val
+        // set is NOT touched here.
+        dataset_shuffle(train, kSeed + static_cast<unsigned long long>(epoch));
 
         double epoch_loss = 0.0; // sum of per-batch mean losses
         double epoch_acc  = 0.0; // sum of per-batch accuracies
@@ -344,13 +397,13 @@ int main() {
             mlp_forward(net, d_batch);           // forward pass through the net
 
             // Metrics use the freshly-cached output probabilities. mlp_compute_loss
-            // runs the per-row CE kernel and averages on the host; mlp_accuracy
+            // runs the per-row CE kernel then reduces on the GPU; mlp_accuracy
             // copies probs to host, argmaxes each row, compares to h_labels.
             epoch_loss += mlp_compute_loss(net, d_labels);
             epoch_acc  += mlp_accuracy(net, h_labels.data());
 
             mlp_backward(net, d_batch, d_labels); // fill dW/db (already /batch)
-            mlp_sgd_step(net, kLearningRate);     // apply the SGD update
+            optim_step(opt, net);                 // (push 0002) optimizer update
         }
 
         // Report on the first epoch, every kReportEvery epochs, and the last one.
@@ -382,6 +435,22 @@ int main() {
     printf("====================================================\n\n");
 
     // -------------------------------------------------------------------------
+    // STEP 8b (push 0002): VALIDATION — measure generalization on the held-out
+    // set the optimizer never trained on. mlp_evaluate runs forward-only (no
+    // backprop, no update) over the val batches and reports mean loss + accuracy.
+    // Comparing this to the final TRAIN accuracy above tells us whether the model
+    // generalized (close numbers) or overfit (train ≫ val). It also exercises the
+    // device-side metric path: mlp_evaluate uses the GPU reduction for both loss
+    // and accuracy (predictions_correct + reduce_sum).
+    // -------------------------------------------------------------------------
+    printf("==================== VALIDATION ===================\n");
+    float val_loss = 0.0f, val_acc = 0.0f;
+    mlp_evaluate(net, val.X, val.y, val.n_samples, val_loss, val_acc);
+    printf("  held-out val: loss %.4f  acc %.3f  (over %d samples)\n",
+           val_loss, val_acc, (val.n_samples / kBatchSize) * kBatchSize);
+    printf("====================================================\n\n");
+
+    // -------------------------------------------------------------------------
     // STEP 9: clean up EVERYTHING (no leaks), then reset the device.
     //   Order does not matter much here, but we mirror allocation: events, the
     //   reusable device buffers, the network's many device matrices (mlp_free),
@@ -393,8 +462,11 @@ int main() {
     CUDA_CHECK(cudaEventDestroy(train_stop));
     matrix_free(d_batch);            // free reusable input batch (device)
     CUDA_CHECK(cudaFree(d_labels));  // free device label buffer
+    optim_free(opt);                 // (push 0002) free optimizer state buffers
     mlp_free(net);                   // frees every Layer's W/b/Z/A/dW/db/dZ/dA
-    dataset_free(data);              // frees host X and y
+    dataset_free(train);             // (push 0002) free the train split
+    dataset_free(val);               // (push 0002) free the val split
+    dataset_free(data);              // frees the original host X and y
 
     CUDA_CHECK(cudaDeviceReset());   // tear down the CUDA context cleanly
     printf("Done. Device reset; all memory freed.\n");

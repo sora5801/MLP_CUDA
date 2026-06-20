@@ -152,3 +152,24 @@ void dataset_standardize(Dataset& d);
 //   d    : dataset to permute in place (both d.X rows and d.y entries).
 //   seed : 64-bit seed for the shuffle RNG.
 void dataset_shuffle(Dataset& d, unsigned long long seed);
+
+// -----------------------------------------------------------------------------
+// dataset_split                                                (added in push 0002)
+// -----------------------------------------------------------------------------
+// Partition `full` into a TRAIN set (its first `n_train` samples) and a
+// VALIDATION set (the remaining `full.n_samples - n_train` samples). Both outputs
+// are freshly-allocated, fully-owning Datasets (their own malloc'd X/y copies),
+// so the caller frees each with dataset_free and may keep using `full`.
+//
+// WHY a held-out validation set: training accuracy alone can't tell you whether
+// the network is learning a generalizable rule or just memorizing the training
+// points. Measuring loss/accuracy on data the optimizer never saw (the val set)
+// is how we estimate real-world performance and detect overfitting. We split AFTER
+// a shuffle so both halves are class-balanced rather than grouped by class.
+//
+// Parameters:
+//   full    : the source dataset to copy from (unchanged).
+//   n_train : number of leading samples to place in `train` (0 < n_train < n).
+//   train   : (out) receives the first n_train samples (owns its memory).
+//   val     : (out) receives the remaining samples (owns its memory).
+void dataset_split(const Dataset& full, int n_train, Dataset& train, Dataset& val);

@@ -523,3 +523,256 @@ void launch_sgd_update(float* param, const float* grad, float lr, int n) {
     sgd_update<<<grid, block>>>(param, grad, lr, n);
     CUDA_CHECK_LAST();
 }
+
+// =============================================================================
+// =============================================================================
+//  ADDED IN PUSH 0002 — see docs/changelog/0002-*.md.
+//  New activations (LeakyReLU, tanh), a parallel reduction, and a device-side
+//  "predictions correct" helper used to compute accuracy on the GPU.
+// =============================================================================
+// =============================================================================
+
+// =============================================================================
+// 11) leaky_relu_forward  —  out[i] = (in[i] > 0) ? in[i] : alpha*in[i].
+// =============================================================================
+//
+// WHAT/WHY: like ReLU but with a small slope `alpha` on the negative side so a
+// unit that always sees negative input still has a nonzero gradient and can
+// recover (avoids the "dead ReLU" problem). Purely element-wise.
+//
+// SHAPES: in/out flat length n. alpha is the negative-side slope (e.g. 0.01).
+__global__ void leaky_relu_forward(const float* in, float* out, int n, float alpha) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;   // flat element index
+    if (i >= n) return;                              // guard padding threads
+    float x = in[i];
+    // Note: writing it as a single ternary lets the compiler emit a predicated
+    // select (no real branch), so warp divergence here is essentially free.
+    out[i] = (x > 0.0f) ? x : alpha * x;
+}
+
+// ---- launch_leaky_relu_forward: 1-D launch over n elements. -----------------
+void launch_leaky_relu_forward(const float* in, float* out, int n, float alpha) {
+    int block = kBlockSize;
+    int grid  = ceil_div(n, block);
+    leaky_relu_forward<<<grid, block>>>(in, out, n, alpha);
+    CUDA_CHECK_LAST();
+}
+
+// =============================================================================
+// 12) leaky_relu_backward  —  grad_in = grad_out * (pre_act>0 ? 1 : alpha).
+// =============================================================================
+//
+// WHAT/WHY: backprop through LeakyReLU. Its derivative is 1 on the positive side
+// and `alpha` on the negative side, so we scale the upstream gradient by that
+// factor. Like relu_backward, the gate is decided by the cached PRE-activation Z.
+//
+// SHAPES: grad_out, pre_act, grad_in flat length n.
+__global__ void leaky_relu_backward(const float* grad_out, const float* pre_act,
+                                    float* grad_in, int n, float alpha) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;   // flat element index
+    if (i >= n) return;                              // guard padding threads
+    grad_in[i] = grad_out[i] * ((pre_act[i] > 0.0f) ? 1.0f : alpha);
+}
+
+// ---- launch_leaky_relu_backward: 1-D launch over n elements. ----------------
+void launch_leaky_relu_backward(const float* grad_out, const float* pre_act,
+                                float* grad_in, int n, float alpha) {
+    int block = kBlockSize;
+    int grid  = ceil_div(n, block);
+    leaky_relu_backward<<<grid, block>>>(grad_out, pre_act, grad_in, n, alpha);
+    CUDA_CHECK_LAST();
+}
+
+// =============================================================================
+// 13) tanh_forward  —  out[i] = tanh(in[i]).
+// =============================================================================
+//
+// WHAT/WHY: the hyperbolic-tangent activation, squashing inputs to (-1, 1). It
+// is smooth and zero-centered. We use tanhf (the single-precision device math
+// intrinsic) rather than the double-precision tanh to match our float data and
+// avoid needless double-precision work on the GPU.
+//
+// SHAPES: in/out flat length n.
+__global__ void tanh_forward(const float* in, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;   // flat element index
+    if (i >= n) return;                              // guard padding threads
+    out[i] = tanhf(in[i]);
+}
+
+// ---- launch_tanh_forward: 1-D launch over n elements. -----------------------
+void launch_tanh_forward(const float* in, float* out, int n) {
+    int block = kBlockSize;
+    int grid  = ceil_div(n, block);
+    tanh_forward<<<grid, block>>>(in, out, n);
+    CUDA_CHECK_LAST();
+}
+
+// =============================================================================
+// 14) tanh_backward  —  grad_in = grad_out * (1 - act^2).
+// =============================================================================
+//
+// WHAT/WHY: backprop through tanh. Since d/dz tanh(z) = 1 - tanh(z)^2, and we
+// already have a = tanh(z) cached as the layer's POST-activation A, the cheapest
+// correct form reads `act` (NOT the pre-activation). This is the key difference
+// from relu/leaky backward, which read the PRE-activation Z. Caching both Z and
+// A in every Layer is exactly what lets each activation pick the tensor it needs.
+//
+// SHAPES: grad_out, act, grad_in flat length n. `act` is A = tanh(Z).
+__global__ void tanh_backward(const float* grad_out, const float* act,
+                              float* grad_in, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;   // flat element index
+    if (i >= n) return;                              // guard padding threads
+    float a = act[i];
+    grad_in[i] = grad_out[i] * (1.0f - a * a);
+}
+
+// ---- launch_tanh_backward: 1-D launch over n elements. ----------------------
+void launch_tanh_backward(const float* grad_out, const float* act,
+                          float* grad_in, int n) {
+    int block = kBlockSize;
+    int grid  = ceil_div(n, block);
+    tanh_backward<<<grid, block>>>(grad_out, act, grad_in, n);
+    CUDA_CHECK_LAST();
+}
+
+// =============================================================================
+// 15) reduce_sum_kernel  —  ONE block-level tree reduction pass.
+// =============================================================================
+//
+// GOAL: sum an array of n floats. A serial sum is n-1 dependent adds; a parallel
+// TREE reduction does it in ceil(log2(blockDim)) steps per block. Each block
+// reduces the slice of the array it owns down to a single partial sum, written
+// to out[blockIdx.x]. Multiple passes (driven by launch_reduce_sum) then reduce
+// those partials until one value remains.
+//
+// STEP 1 — "first add during load":
+//   A block of B threads is responsible for 2*B input elements. Each thread
+//   loads element i and element i+B and adds them immediately, so the very first
+//   level of the tree happens while reading global memory (no idle half-block,
+//   half as many global reads). Out-of-range loads contribute 0.
+//
+// STEP 2 — in-shared-memory tree:
+//   The B partial values live in dynamically-sized __shared__ memory `sdata`.
+//   We then halve the active range each step: stride s = B/2, B/4, ..., 1. At
+//   each step the lower `s` threads add the upper half into the lower half:
+//       sdata[tid] += sdata[tid + s];
+//   A __syncthreads() after every step guarantees all adds of that level are
+//   visible before the next level reads them (avoids a read-before-write race).
+//   This pattern requires blockDim.x to be a power of two (kBlockSize = 256 ✓).
+//   Thread 0 ends up holding the block's total and writes it to out[blockIdx.x].
+//
+// WHY shared memory: the running partials are read and written log2(B) times;
+// keeping them in on-chip shared memory (≈100x faster than global) instead of
+// global memory is what makes the reduction fast. (optimization: the last warp
+// can be unrolled and use __shfl_down_sync to drop the final __syncthreads
+// calls — left as an exercise; see docs/cuda_concepts.md.)
+__global__ void reduce_sum_kernel(const float* in, float* out, int n) {
+    // Dynamically-sized shared scratch; its byte size is the 3rd launch argument
+    // (blockDim.x * sizeof(float)). One slot per thread.
+    extern __shared__ float sdata[];
+
+    int tid = threadIdx.x;                       // lane within the block
+    // This block owns 2*blockDim.x consecutive elements starting here:
+    int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
+
+    // First add during load: grab in[i] and in[i+blockDim.x] (each guarded so
+    // out-of-range positions add nothing). This collapses the first tree level.
+    float v = 0.0f;
+    if (i < n)                v  = in[i];
+    if (i + blockDim.x < n)   v += in[i + blockDim.x];
+    sdata[tid] = v;
+    __syncthreads();                             // whole tile loaded before reduce
+
+    // Tree reduction in shared memory: fold the upper half into the lower half,
+    // halving the active width each step until only sdata[0] is meaningful.
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();                         // level complete before next one
+    }
+
+    // Thread 0 holds the block's total. One global write per block.
+    if (tid == 0) {
+        out[blockIdx.x] = sdata[0];
+    }
+}
+
+// ---- launch_reduce_sum: drive multiple passes down to a single scalar. ------
+// We cannot sum across blocks inside one kernel (blocks don't share memory or a
+// barrier), so we loop: pass 1 turns n elements into `blocks` partials; pass 2
+// turns those into fewer partials; ... until one value remains. Two scratch
+// buffers are "ping-ponged" so each pass reads one and writes the other.
+float launch_reduce_sum(const float* d_in, int n) {
+    if (n <= 0) return 0.0f;
+
+    const int block = kBlockSize;                 // 256 (power of two, required)
+
+    // Number of blocks (= partials) the FIRST pass will produce. Because every
+    // thread adds 2 elements, each block consumes 2*block elements.
+    int first_blocks = ceil_div(n, 2 * block);
+
+    // Two scratch buffers, each large enough to hold the largest partial array we
+    // will ever produce (the first pass's output). Subsequent passes are smaller.
+    float* buf_a = nullptr;
+    float* buf_b = nullptr;
+    CUDA_CHECK(cudaMalloc(&buf_a, sizeof(float) * first_blocks));
+    CUDA_CHECK(cudaMalloc(&buf_b, sizeof(float) * first_blocks));
+
+    // ---- Pass 1: reduce the ORIGINAL input (d_in) into buf_a. ----
+    int blocks = first_blocks;
+    reduce_sum_kernel<<<blocks, block, block * sizeof(float)>>>(d_in, buf_a, n);
+    CUDA_CHECK_LAST();
+    int cur_n = blocks;                           // this many partials remain
+
+    // ---- Passes 2..: keep reducing the partials until a single value is left. ----
+    float* cur   = buf_a;                         // buffer holding current partials
+    float* other = buf_b;                         // scratch to write the next pass
+    while (cur_n > 1) {
+        blocks = ceil_div(cur_n, 2 * block);
+        reduce_sum_kernel<<<blocks, block, block * sizeof(float)>>>(cur, other, cur_n);
+        CUDA_CHECK_LAST();
+        cur_n = blocks;
+        float* tmp = cur; cur = other; other = tmp;   // ping-pong the buffers
+    }
+
+    // `cur[0]` now holds the full sum. Copy that ONE float back to the host.
+    float result = 0.0f;
+    CUDA_CHECK(cudaMemcpy(&result, cur, sizeof(float), cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaFree(buf_a));
+    CUDA_CHECK(cudaFree(buf_b));
+    return result;
+}
+
+// =============================================================================
+// 16) predictions_correct  —  per-row argmax == label  ->  1.0f else 0.0f.
+// =============================================================================
+//
+// WHAT/WHY: produces a 0/1 vector of per-sample correctness so accuracy can be
+// computed on the GPU as launch_reduce_sum(correct)/rows. Each thread owns one
+// row, scans its `cols` probabilities for the argmax, and compares to the label.
+//
+// SHAPES: probs [rows,cols]; labels device int[rows]; correct device float[rows].
+__global__ void predictions_correct(const float* probs, const int* labels,
+                                    float* correct, int rows, int cols) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;   // this thread's row
+    if (r >= rows) return;                            // guard padding threads
+
+    const float* row = probs + (size_t)r * cols;      // start of this sample's row
+    int   best_c = 0;                                 // argmax index so far
+    float best_p = row[0];                            // argmax value so far
+    for (int c = 1; c < cols; ++c) {
+        if (row[c] > best_p) { best_p = row[c]; best_c = c; }
+    }
+    correct[r] = (best_c == labels[r]) ? 1.0f : 0.0f;
+}
+
+// ---- launch_predictions_correct: 1-D launch over rows (one thread per row). --
+void launch_predictions_correct(const float* probs, const int* labels,
+                                float* correct, int rows, int cols) {
+    int block = kBlockSize;
+    int grid  = ceil_div(rows, block);
+    predictions_correct<<<grid, block>>>(probs, labels, correct, rows, cols);
+    CUDA_CHECK_LAST();
+}

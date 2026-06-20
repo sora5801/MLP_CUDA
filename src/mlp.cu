@@ -39,6 +39,12 @@
 #include <cstdio>       // std::printf for grad-check reporting
 #include <vector>       // std::vector for host-side scratch buffers
 
+// Negative-side slope used by the LeakyReLU activation (push 0002). A small
+// constant (0.01 is the conventional default) so dead-unit gradients stay
+// nonzero. Kept here as a single named knob rather than a magic number sprinkled
+// through the dispatch code below.
+static constexpr float kLeakyAlpha = 0.01f;
+
 // ----------------------------------------------------------------------------
 //  mlp_create
 // ----------------------------------------------------------------------------
@@ -64,7 +70,7 @@
 //  stays ~constant across layers, which keeps gradients from vanishing/exploding
 //  early in training. `in` is the fan-in (number of inputs to the neuron).
 MLP mlp_create(const int* layer_sizes, int num_sizes, int batch_size,
-               unsigned long long seed) {
+               unsigned long long seed, Activation hidden_act) {
     MLP net;
     net.num_layers      = num_sizes - 1;          // edges between the size nodes
     net.batch_size      = batch_size;
@@ -84,8 +90,12 @@ MLP mlp_create(const int* layer_sizes, int num_sizes, int batch_size,
         Layer& L = net.layers[l];
         L.in_features  = layer_sizes[l];          // fan-in  of this layer
         L.out_features = layer_sizes[l + 1];      // fan-out of this layer
-        // The LAST layer is the softmax output layer; all others use ReLU.
+        // The LAST layer is the softmax output layer; all others use the chosen
+        // hidden activation. We still record `activation` on the output layer for
+        // completeness, but is_output makes the forward/backward code use softmax
+        // there regardless of this field.
         L.is_output    = (l == net.num_layers - 1);
+        L.activation   = hidden_act;
 
         const int in  = L.in_features;
         const int out = L.out_features;
@@ -199,9 +209,21 @@ void mlp_forward(MLP& net, const Matrix& batch_input) {
         if (L.is_output) {
             launch_softmax_rows(L.Z.data, L.A.data, batch, out);
         } else {
-            // ReLU is purely elementwise, so we treat Z/A as flat arrays of
-            // batch*out elements (the 2-D shape is irrelevant to max(0,x)).
-            launch_relu_forward(L.Z.data, L.A.data, batch * out);
+            // Hidden layer: dispatch on the configured activation (push 0002).
+            // All of these are purely elementwise, so we treat Z/A as flat arrays
+            // of batch*out elements (the 2-D shape is irrelevant to act(x)).
+            const int m = batch * out;
+            switch (L.activation) {
+                case Activation::ReLU:
+                    launch_relu_forward(L.Z.data, L.A.data, m);
+                    break;
+                case Activation::LeakyReLU:
+                    launch_leaky_relu_forward(L.Z.data, L.A.data, m, kLeakyAlpha);
+                    break;
+                case Activation::Tanh:
+                    launch_tanh_forward(L.Z.data, L.A.data, m);
+                    break;
+            }
         }
 
         // The output of this layer becomes the input to the next.
@@ -288,11 +310,31 @@ void mlp_backward(MLP& net, const Matrix& batch_input, const int* d_labels) {
                         /*M=*/batch, /*N=*/in, /*K=*/out_f,
                         /*transA=*/false, /*transB=*/true);
 
-            // dZ_prev = dA_prev ⊙ relu'(Z_prev). relu_backward gates each element
-            // of dA by whether the corresponding PRE-activation Z_prev was > 0.
+            // dZ_prev = dA_prev ⊙ act'(Z_prev): turn the gradient wrt the previous
+            // layer's OUTPUT (dA) into the gradient wrt its PRE-activation (dZ) by
+            // multiplying through the activation derivative. Dispatch on the
+            // previous layer's activation (push 0002). KEY SUBTLETY:
+            //   - ReLU / LeakyReLU gate on the PRE-activation Z_prev (sign of z).
+            //   - Tanh uses the POST-activation A_prev, because tanh'(z)=1-a^2 is
+            //     written in terms of a=tanh(z). Passing the wrong tensor here is
+            //     a classic, silent backprop bug — the grad-check would catch it.
             // Treated as a flat array of batch*prevL.out_features elements.
-            launch_relu_backward(prevL.dA.data, prevL.Z.data, prevL.dZ.data,
-                                  batch * prevL.out_features);
+            const int m_prev = batch * prevL.out_features;
+            switch (prevL.activation) {
+                case Activation::ReLU:
+                    launch_relu_backward(prevL.dA.data, prevL.Z.data,
+                                         prevL.dZ.data, m_prev);
+                    break;
+                case Activation::LeakyReLU:
+                    launch_leaky_relu_backward(prevL.dA.data, prevL.Z.data,
+                                               prevL.dZ.data, m_prev, kLeakyAlpha);
+                    break;
+                case Activation::Tanh:
+                    // NOTE: passes prevL.A (the tanh OUTPUT), not prevL.Z.
+                    launch_tanh_backward(prevL.dA.data, prevL.A.data,
+                                         prevL.dZ.data, m_prev);
+                    break;
+            }
         }
     }
 }
@@ -335,10 +377,12 @@ void mlp_sgd_step(MLP& net, float lr) {
 //  Returns: scalar mean loss = (1/batch) * sum_r -log(probs[r, label[r]]).
 //
 //  Strategy: cross_entropy_loss computes the per-row loss on the device (one
-//  thread per row), we copy that small length-`batch` vector to the host, sum it,
-//  and divide by batch. The reduction is done on the host because `batch` is
-//  small and a host sum keeps this didactic code simple (a device reduction is
-//  left as an exercise).
+//  thread per row), then (push 0002) launch_reduce_sum sums those per-row losses
+//  ON THE GPU with a parallel tree reduction, and we divide by batch on the host.
+//  Only a SINGLE float crosses the PCIe bus (the total), versus copying the whole
+//  length-`batch` vector back as the original host reduction did. This is the
+//  payoff of the reduction lesson: keep the data on the device and read back one
+//  scalar. (The earlier host-sum version is preserved in git history / push 0001.)
 float mlp_compute_loss(MLP& net, const int* d_labels) {
     const int batch       = net.batch_size;
     const int num_classes = net.num_classes;
@@ -350,15 +394,11 @@ float mlp_compute_loss(MLP& net, const int* d_labels) {
     launch_cross_entropy_loss(out.A.data, d_labels, loss_per_row.data,
                               batch, num_classes);
 
-    // Copy the small per-row vector D2H and reduce on the host.
-    std::vector<float> h_loss(batch);
-    matrix_copy_to_host(loss_per_row, h_loss.data());
-
-    double sum = 0.0;  // accumulate in double to limit rounding error
-    for (int r = 0; r < batch; ++r) sum += h_loss[r];
+    // Sum the per-row losses on the GPU; only the scalar total comes back.
+    float total = launch_reduce_sum(loss_per_row.data, batch);
 
     matrix_free(loss_per_row);   // release the temporary device buffer
-    return static_cast<float>(sum / batch);
+    return total / static_cast<float>(batch);
 }
 
 // ----------------------------------------------------------------------------
@@ -397,6 +437,89 @@ float mlp_accuracy(MLP& net, const int* h_labels) {
         if (best_c == h_labels[r]) ++correct;
     }
     return static_cast<float>(correct) / static_cast<float>(batch);
+}
+
+// ----------------------------------------------------------------------------
+//  mlp_accuracy_device                                       (added in push 0002)
+// ----------------------------------------------------------------------------
+//  Accuracy computed entirely on the GPU, as a counterpoint to the host-side
+//  argmax loop in mlp_accuracy above. Two kernels do the work:
+//    1) predictions_correct : per row, argmax(probs row) == label ? 1.0 : 0.0
+//    2) launch_reduce_sum   : parallel tree reduction summing that 0/1 vector
+//  Dividing the sum by batch yields the fraction correct. Takes DEVICE labels
+//  because the comparison happens inside the kernel. Nothing but the final scalar
+//  count is copied back to the host (inside launch_reduce_sum).
+float mlp_accuracy_device(MLP& net, const int* d_labels) {
+    const int batch       = net.batch_size;
+    const int num_classes = net.num_classes;
+    Layer& out = net.layers[net.num_layers - 1];
+
+    // 0/1 correctness flag per sample, on the device.
+    Matrix correct = matrix_alloc(batch, 1);
+    launch_predictions_correct(out.A.data, d_labels, correct.data,
+                               batch, num_classes);
+
+    // Sum the flags on the GPU -> number correct -> fraction.
+    float n_correct = launch_reduce_sum(correct.data, batch);
+
+    matrix_free(correct);
+    return n_correct / static_cast<float>(batch);
+}
+
+// ----------------------------------------------------------------------------
+//  mlp_evaluate                                              (added in push 0002)
+// ----------------------------------------------------------------------------
+//  Forward-only "inference mode" pass over a held-out split, used to measure how
+//  well the network generalizes to data it was NOT trained on. There is no
+//  backward pass and no parameter update here — we only push batches through
+//  mlp_forward and read off loss/accuracy. (Conceptually this is where you would
+//  also disable train-only behaviors like dropout; this network has none yet.)
+//
+//  It mirrors the training loop's batching: it processes floor(n_samples/batch)
+//  full batches and drops any remainder, so every batch is exactly `batch` rows
+//  (which keeps the fixed-size device buffers and the 1/batch loss scaling valid).
+//  Device scratch (one [batch, in] matrix + a device label buffer) is allocated
+//  and freed inside, so the function is self-contained.
+void mlp_evaluate(MLP& net, const float* X, const int* y, int n_samples,
+                  float& out_loss, float& out_acc) {
+    const int batch     = net.batch_size;
+    const int in_f      = net.input_features;
+    const int n_batches = n_samples / batch;   // full batches only (drop remainder)
+
+    if (n_batches == 0) {                      // not enough data for one batch
+        out_loss = 0.0f;
+        out_acc  = 0.0f;
+        return;
+    }
+
+    // Reusable device scratch for one batch of features + its labels.
+    Matrix d_batch  = matrix_alloc(batch, in_f);
+    int*   d_labels = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_labels, sizeof(int) * batch));
+
+    double loss_sum = 0.0;   // accumulate per-batch means, averaged at the end
+    double acc_sum  = 0.0;
+    for (int b = 0; b < n_batches; ++b) {
+        const int row0 = b * batch;
+
+        // Upload this batch's features and labels (H2D). The features for rows
+        // [row0, row0+batch) are contiguous in X (row-major, in_f per row).
+        matrix_copy_to_device(d_batch, X + static_cast<size_t>(row0) * in_f);
+        CUDA_CHECK(cudaMemcpy(d_labels, y + row0, sizeof(int) * batch,
+                              cudaMemcpyHostToDevice));
+
+        // Inference: forward pass only, then read the metrics off the cached
+        // output probabilities (both reductions run on the GPU).
+        mlp_forward(net, d_batch);
+        loss_sum += mlp_compute_loss(net, d_labels);
+        acc_sum  += mlp_accuracy_device(net, d_labels);
+    }
+
+    out_loss = static_cast<float>(loss_sum / n_batches);
+    out_acc  = static_cast<float>(acc_sum  / n_batches);
+
+    matrix_free(d_batch);
+    CUDA_CHECK(cudaFree(d_labels));
 }
 
 // ----------------------------------------------------------------------------

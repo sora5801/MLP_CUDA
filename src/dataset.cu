@@ -263,3 +263,48 @@ void dataset_shuffle(Dataset& d, unsigned long long seed) {
         d.y[j] = ty;
     }
 }
+
+// ----------------------------------------------------------------------------
+//  void dataset_split(const Dataset& full, int n_train,
+//                     Dataset& train, Dataset& val)            (added in push 0002)
+// ----------------------------------------------------------------------------
+//  WHAT IT DOES
+//  Copies the first `n_train` samples of `full` into `train` and the remaining
+//  `full.n_samples - n_train` samples into `val`. Each output is an independent,
+//  fully-owning Dataset (its own malloc'd X and y), so freeing one never affects
+//  the other or `full`.
+//
+//  MEMORY LAYOUT NOTE
+//  Because X is row-major [n_samples, n_features], the samples for each split are
+//  a CONTIGUOUS block of floats: train gets X[0 .. n_train*F), val gets the rest.
+//  A single std::memcpy-style loop per split copies the block; labels copy in
+//  parallel. n_classes/n_features are carried over unchanged.
+//
+//  PRECONDITION: 0 < n_train < full.n_samples (so both splits are non-empty). The
+//  caller (main.cu) chooses n_train as a multiple of the batch size so neither
+//  split drops a batch unexpectedly.
+void dataset_split(const Dataset& full, int n_train, Dataset& train, Dataset& val) {
+    const int F       = full.n_features;
+    const int n_total = full.n_samples;
+    const int n_val   = n_total - n_train;
+
+    // --- Fill in the scalar metadata for both splits. ---
+    train.n_features = F;  train.n_classes = full.n_classes;  train.n_samples = n_train;
+    val.n_features   = F;  val.n_classes   = full.n_classes;  val.n_samples   = n_val;
+
+    // --- Allocate owning host buffers for each split (bytes, like make_blobs). ---
+    train.X = (float*)std::malloc((size_t)n_train * F * sizeof(float));
+    train.y = (int*)  std::malloc((size_t)n_train * sizeof(int));
+    val.X   = (float*)std::malloc((size_t)n_val   * F * sizeof(float));
+    val.y   = (int*)  std::malloc((size_t)n_val   * sizeof(int));
+
+    // --- Copy the TRAIN block: samples [0, n_train). ---
+    for (size_t i = 0; i < (size_t)n_train * F; ++i) train.X[i] = full.X[i];
+    for (int    r = 0; r < n_train;             ++r) train.y[r] = full.y[r];
+
+    // --- Copy the VAL block: samples [n_train, n_total). ---
+    // Source feature offset is n_train rows in; labels start at index n_train.
+    const size_t val_feat_off = (size_t)n_train * F;
+    for (size_t i = 0; i < (size_t)n_val * F; ++i) val.X[i] = full.X[val_feat_off + i];
+    for (int    r = 0; r < n_val;            ++r) val.y[r] = full.y[n_train + r];
+}

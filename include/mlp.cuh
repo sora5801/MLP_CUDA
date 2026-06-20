@@ -18,6 +18,24 @@
 #include "matrix.cuh"
 
 // ----------------------------------------------------------------------------
+//  enum class Activation                                     (added in push 0002)
+//  ----------------------------------------------------------------------------
+//  Selects which nonlinearity a HIDDEN layer applies after its affine step. The
+//  OUTPUT layer ignores this and always uses softmax (gated by Layer::is_output).
+//  Each value maps to a forward kernel and a backward kernel in kernels.cu:
+//    ReLU      -> relu_forward       / relu_backward        (gate on pre-act Z)
+//    LeakyReLU -> leaky_relu_forward / leaky_relu_backward  (gate on pre-act Z)
+//    Tanh      -> tanh_forward       / tanh_backward         (uses post-act A!)
+//  The Tanh case is the didactic one: its derivative 1 - a^2 is written in terms
+//  of the OUTPUT a = tanh(z), so its backward reads A, whereas the (Leaky)ReLU
+//  backward reads Z. mlp_backward dispatches to the right tensor per activation.
+//  `enum class` (scoped enum) keeps these names from leaking into the global
+//  namespace — you write Activation::ReLU, and they don't implicitly convert to
+//  int, which prevents a whole category of mix-up bugs.
+// ----------------------------------------------------------------------------
+enum class Activation { ReLU, LeakyReLU, Tanh };
+
+// ----------------------------------------------------------------------------
 //  struct Layer
 //  ----------------------------------------------------------------------------
 //  One fully-connected (a.k.a. "linear" / "dense") layer plus its activation.
@@ -40,7 +58,9 @@ struct Layer {
     int in_features;    // `in`  : length of each input  row  (units: features)
     int out_features;   // `out` : length of each output row  (units: neurons)
     bool is_output;     // true  => softmax activation (this is the final layer);
-                        // false => ReLU activation (a hidden layer).
+                        // false => use `activation` below (a hidden layer).
+    Activation activation; // (push 0002) which nonlinearity a HIDDEN layer uses.
+                        // Ignored when is_output is true (output is softmax).
 
     // ---- parameters (the learnable weights; persist across batches) ---------
     Matrix W;           // [in, out]  weights. Row-major: W[i*out + o] is the
@@ -111,9 +131,16 @@ struct MLP {
 //    num_sizes   : its length (>= 2).
 //    batch_size  : rows per minibatch (fixes every cache's row count).
 //    seed        : RNG seed for reproducible weight init.
+//    hidden_act  : (push 0002) nonlinearity for ALL hidden layers; defaults to
+//                  ReLU so older callers compile unchanged. The output layer is
+//                  always softmax regardless. NOTE: He init (sqrt(2/in)) is tuned
+//                  for ReLU-family activations; for Tanh, Xavier/Glorot init
+//                  would be more principled, but He still trains fine here and we
+//                  keep one init path for simplicity (noted as an exercise).
 //  Returns: a fully-allocated MLP (caller must later call mlp_free).
 MLP  mlp_create(const int* layer_sizes, int num_sizes, int batch_size,
-                unsigned long long seed);
+                unsigned long long seed,
+                Activation hidden_act = Activation::ReLU);
 
 // Frees every device Matrix in every layer, frees the host `layers` array, and
 // zeroes the MLP's fields so the struct can't be accidentally reused. Mirrors
@@ -183,9 +210,10 @@ void mlp_sgd_step(MLP& net, float lr);
 //  ----------------------------------------------------------------------------
 //  Mean softmax cross-entropy over the current batch, computed from the cached
 //  output probabilities (layers[last].A) and the given DEVICE labels `d_labels`
-//  (length batch). Runs cross_entropy_loss (per-row -log p[label]), copies the
-//  per-row losses to host, sums and divides by batch. Returns the scalar mean
-//  loss. (Reporting only -- not used to drive gradients.)
+//  (length batch). Runs cross_entropy_loss (per-row -log p[label]), then (push
+//  0002) sums the per-row losses on the GPU via launch_reduce_sum and divides by
+//  batch — only the scalar total is copied to the host. Returns the mean loss.
+//  (Reporting only -- not used to drive gradients.)
 float mlp_compute_loss(MLP& net, const int* d_labels);
 
 // ----------------------------------------------------------------------------
@@ -214,3 +242,36 @@ float mlp_accuracy(MLP& net, const int* h_labels);
 //  use). `batch_input` is the device batch to evaluate on.
 void mlp_grad_check(MLP& net, const Matrix& batch_input,
                     const int* d_labels, const int* h_labels);
+
+// ----------------------------------------------------------------------------
+//  mlp_accuracy_device                                       (added in push 0002)
+//  ----------------------------------------------------------------------------
+//  Same result as mlp_accuracy, but computed ENTIRELY on the GPU instead of via
+//  a host argmax loop. It runs `predictions_correct` (per-row argmax == label ->
+//  1/0) then `launch_reduce_sum` (parallel tree reduction) over the batch, and
+//  divides by batch. Takes DEVICE labels (`d_labels`, length batch) since the
+//  comparison happens in the kernel. Kept alongside the host mlp_accuracy on
+//  purpose, to contrast a host-side reduction with a device-side one.
+float mlp_accuracy_device(MLP& net, const int* d_labels);
+
+// ----------------------------------------------------------------------------
+//  mlp_evaluate                                              (added in push 0002)
+//  ----------------------------------------------------------------------------
+//  Forward-ONLY evaluation over a held-out split (no backprop, no weight update)
+//  — i.e. "inference mode". Used to measure generalization on validation data.
+//  It batches the host arrays X/y into full batch_size chunks (dropping any
+//  remainder, like training), runs mlp_forward on each, and accumulates the mean
+//  cross-entropy loss and accuracy across batches; results are returned via the
+//  out-params. It allocates its own small device scratch (a [batch, in] matrix
+//  and a device label buffer) and frees it before returning, so it is fully
+//  self-contained and safe to call any time after mlp_create.
+//
+//  Params:
+//    net       : trained (or training) network; its caches are overwritten.
+//    X         : HOST features, [n_samples, input_features] row-major.
+//    y         : HOST labels,   [n_samples], class indices in [0, num_classes).
+//    n_samples : number of rows in X/y.
+//    out_loss  : (out) mean CE loss over the evaluated full batches.
+//    out_acc   : (out) mean accuracy over the evaluated full batches, in [0,1].
+void mlp_evaluate(MLP& net, const float* X, const int* y, int n_samples,
+                  float& out_loss, float& out_acc);

@@ -349,3 +349,160 @@ __global__ void sgd_update(float* param, const float* grad, float lr, int n);
 
 // Host wrapper: 1-D launch over n elements, then CUDA_CHECK_LAST().
 void launch_sgd_update(float* param, const float* grad, float lr, int n);
+
+
+// ============================================================================
+// ============================================================================
+//  ADDED IN PUSH 0002 — extra activations, a parallel reduction, and a
+//  device-side "predictions correct" helper. See docs/changelog/0002-*.md.
+// ============================================================================
+// ============================================================================
+
+
+// ============================================================================
+// 11) leaky_relu_forward — out[i] = (in[i] > 0) ? in[i] : alpha*in[i].
+// ----------------------------------------------------------------------------
+// A variant of ReLU that, instead of hard-zeroing negative inputs, lets them
+// through with a small slope `alpha` (e.g. 0.01). WHY: a plain ReLU unit whose
+// input is always negative outputs 0 forever and its weights get a 0 gradient
+// (relu'(z)=0) — a "dead" neuron that can never recover. LeakyReLU keeps a tiny
+// nonzero gradient `alpha` on the negative side so such a unit can still learn.
+//
+// Parameters:
+//   in    : input array, length n (flattened [batch, out] pre-activation Z).
+//   out   : output array, length n (post-activation A). May alias `in`.
+//   n     : total elements (batch * out_features).
+//   alpha : negative-side slope (0 < alpha < 1; this repo uses 0.01).
+//
+// Launch config: the standard 1-D element-wise grid (kBlockSize threads/block).
+// ============================================================================
+__global__ void leaky_relu_forward(const float* in, float* out, int n, float alpha);
+
+// Host wrapper: 1-D launch over n elements, then CUDA_CHECK_LAST().
+void launch_leaky_relu_forward(const float* in, float* out, int n, float alpha);
+
+
+// ============================================================================
+// 12) leaky_relu_backward — gradient through LeakyReLU.
+// ----------------------------------------------------------------------------
+// d/dz LeakyReLU(z) = 1 if z > 0 else alpha. So the upstream gradient passes
+// through unchanged on the positive side and is scaled by `alpha` (not zeroed)
+// on the negative side. Like relu_backward we gate on the cached PRE-activation.
+//   grad_in[i] = grad_out[i] * (pre_act[i] > 0 ? 1 : alpha)
+//
+// Parameters:
+//   grad_out : upstream gradient dA, length n.
+//   pre_act  : the layer's pre-activation Z (used only for its sign), length n.
+//   grad_in  : output gradient dZ (overwritten), length n. May alias grad_out.
+//   n        : total elements (batch * out_features).
+//   alpha    : same negative-side slope used in the forward pass.
+// ============================================================================
+__global__ void leaky_relu_backward(const float* grad_out, const float* pre_act,
+                                    float* grad_in, int n, float alpha);
+
+// Host wrapper: 1-D launch over n elements, then CUDA_CHECK_LAST().
+void launch_leaky_relu_backward(const float* grad_out, const float* pre_act,
+                                float* grad_in, int n, float alpha);
+
+
+// ============================================================================
+// 13) tanh_forward — out[i] = tanh(in[i]).
+// ----------------------------------------------------------------------------
+// The hyperbolic-tangent activation, squashing each input into (-1, 1). Smooth
+// and zero-centered (unlike ReLU). Purely element-wise, computed with the CUDA
+// math-library intrinsic tanhf().
+//
+// Parameters:
+//   in  : input array, length n (pre-activation Z).
+//   out : output array, length n (post-activation A = tanh(Z)). May alias `in`.
+//   n   : total elements (batch * out_features).
+// ============================================================================
+__global__ void tanh_forward(const float* in, float* out, int n);
+
+// Host wrapper: 1-D launch over n elements, then CUDA_CHECK_LAST().
+void launch_tanh_forward(const float* in, float* out, int n);
+
+
+// ============================================================================
+// 14) tanh_backward — gradient through tanh.
+// ----------------------------------------------------------------------------
+// d/dz tanh(z) = 1 - tanh(z)^2. The crucial, easy-to-miss detail: this is
+// expressed in terms of the OUTPUT a = tanh(z), so tanh_backward consumes the
+// cached POST-activation `act` (the layer's A), NOT the pre-activation Z that
+// relu_backward / leaky_relu_backward use. Mixing these up is a classic bug; we
+// keep both Z and A cached so each activation can read whichever it needs.
+//   grad_in[i] = grad_out[i] * (1 - act[i]*act[i])
+//
+// Parameters:
+//   grad_out : upstream gradient dA, length n.
+//   act      : the layer's POST-activation A = tanh(Z), length n.
+//   grad_in  : output gradient dZ (overwritten), length n.
+//   n        : total elements (batch * out_features).
+// ============================================================================
+__global__ void tanh_backward(const float* grad_out, const float* act,
+                              float* grad_in, int n);
+
+// Host wrapper: 1-D launch over n elements, then CUDA_CHECK_LAST().
+void launch_tanh_backward(const float* grad_out, const float* act,
+                          float* grad_in, int n);
+
+
+// ============================================================================
+// 15) reduce_sum_kernel — one tree-reduction pass summing an array.
+// ----------------------------------------------------------------------------
+// THE canonical CUDA parallel-reduction lesson. Summing n numbers is inherently
+// sequential (each add depends on the last), but a *tree* turns it into log2(n)
+// parallel steps: pair up neighbors, sum each pair, repeat on the halved array.
+//
+// This kernel reduces WITHIN each block using shared memory and emits ONE
+// partial sum per block into `out[blockIdx.x]`. Because a block can only sum the
+// elements it owns, fully reducing an array of n elements takes multiple passes
+// (n -> #blocks -> ... -> 1); the launch_reduce_sum wrapper drives that loop.
+//
+// Design choices (all explained in src/kernels.cu and docs/cuda_concepts.md):
+//   * Each thread first adds TWO global elements at load time ("first add during
+//     load"), halving the number of idle threads and global reads.
+//   * The in-block reduction walks `s = blockDim.x/2, /4, ... 1`, with a
+//     __syncthreads() between steps so every partial is visible before it is
+//     consumed. This requires blockDim.x to be a power of two (kBlockSize=256 ✓).
+//   * Shared-memory size is passed dynamically as the 3rd launch argument
+//     (blockDim.x * sizeof(float)); inside, it is `extern __shared__ float[]`.
+//
+// Parameters:
+//   in  : input array in device global memory, length n.
+//   out : output array, length >= gridDim.x; out[b] = sum of block b's slice.
+//   n   : number of valid input elements (the grid may cover more; we guard).
+// ============================================================================
+__global__ void reduce_sum_kernel(const float* in, float* out, int n);
+
+// Host wrapper: fully reduces d_in[0..n) to a single scalar by repeatedly
+// launching reduce_sum_kernel (ping-ponging two scratch buffers) until one value
+// remains, then copies it to the host and returns it. Returns 0 for n <= 0.
+// This is "reduce on the GPU, read back one float" — vastly less host<->device
+// traffic than copying the whole array back and summing on the CPU.
+float launch_reduce_sum(const float* d_in, int n);
+
+
+// ============================================================================
+// 16) predictions_correct — per-row argmax-equals-label indicator (1.0 / 0.0).
+// ----------------------------------------------------------------------------
+// For each row (sample) r, find the predicted class = argmax_c probs[r,c] and
+// write 1.0 if it equals labels[r], else 0.0. Summing this vector (via
+// launch_reduce_sum) and dividing by `rows` gives accuracy — entirely on the
+// GPU. This pairs with the reduction above to show a full device-side metric,
+// contrasting with the host-side argmax loop in mlp_accuracy().
+//
+// Parameters:
+//   probs   : [rows, cols] softmax probabilities. GPU global memory.
+//   labels  : length `rows`, true class indices. DEVICE int array.
+//   correct : length `rows` output; correct[r] in {0.0f, 1.0f} (overwritten).
+//   rows    : batch size.   cols : num_classes.
+//
+// Launch config: 1-D grid over rows, one thread per row; guard r < rows.
+// ============================================================================
+__global__ void predictions_correct(const float* probs, const int* labels,
+                                    float* correct, int rows, int cols);
+
+// Host wrapper: 1-D launch over `rows`, then CUDA_CHECK_LAST().
+void launch_predictions_correct(const float* probs, const int* labels,
+                                float* correct, int rows, int cols);
